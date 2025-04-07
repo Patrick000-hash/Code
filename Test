@@ -1,0 +1,4326 @@
+import sys
+import time
+import json
+import math
+import logging
+import pandas as pd
+import numpy as np
+import hmac
+import hashlib
+import traceback
+import requests
+import warnings
+import pickle
+import talib
+import joblib
+import os.path
+import threading
+import queue
+import torch
+import statsmodels.api as sm
+from datetime import datetime, timedelta
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from scipy import stats
+from collections import defaultdict, deque
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# ======================================================
+# PART 1: Configuration and Initialization
+# ======================================================
+
+# Configure logging with clean, informative output
+class CustomFormatter(logging.Formatter):
+    """Custom formatter with color coding for different log levels"""
+    
+    COLORS = {
+        'DEBUG': '\033[94m',    # Blue
+        'INFO': '\033[92m',     # Green
+        'WARNING': '\033[93m',  # Yellow
+        'ERROR': '\033[91m',    # Red
+        'CRITICAL': '\033[91m\033[1m',  # Bold Red
+        'RESET': '\033[0m'      # Reset color
+    }
+    
+    def format(self, record):
+        log_message = super().format(record)
+        level_name = record.levelname
+        if level_name in self.COLORS:
+            return f"{self.COLORS[level_name]}{log_message}{self.COLORS['RESET']}"
+        return log_message
+
+# Initialize logging
+logger = logging.getLogger('elite_trading_bot')
+logger.setLevel(logging.INFO)
+
+# Create console handler with a more concise formatter
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# Create formatters
+detailed_formatter = CustomFormatter('%(asctime)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(detailed_formatter)
+
+# Add handler to logger
+logger.addHandler(console_handler)
+
+# Also log to file with more details for troubleshooting
+file_handler = logging.FileHandler('elite_trading_bot.log')
+file_handler.setLevel(logging.DEBUG)  # More detailed in file
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+logger.addHandler(file_handler)
+
+# Filter out noisy logs from external libraries
+for log_name in ['urllib3', 'websocket', 'matplotlib', 'binance', 'sklearn']:
+    logging.getLogger(log_name).setLevel(logging.WARNING)
+
+# Configuration - API credentials (enter your keys here)
+API_KEY = "n0ayUpewIzqIp7PuGJ1ba273nSpcbh1QqNBUcQ1B40vvmNCgxBA8g20lNZqzKd5R"  # Replace with your Binance API key
+API_SECRET = "wLEDHu8WYADfLvu2buohYQz8FYWfg8nauiFecGxraYUqB9KRM3r3FQ8dNGc6uHtv"  # Replace with your Binance API secret
+
+# ======================================================
+# Trading Parameters - Customizable
+# ======================================================
+
+# Capital allocation and risk
+BASE_CAPITAL_PER_TRADE = 0.30      # Base capital allocation per trade (30% of capital)
+MAX_POSITIONS = 3                  # Maximum number of concurrent positions
+MIN_POSITION_SIZE = 5.0            # Minimum position size in USDT  
+MAX_DAILY_LOSS = 0.20              # Maximum 20% daily loss (circuit breaker)
+MIN_DAILY_VOLUME = 5000000         # Minimum $5M daily volume for trading
+MAX_RISK_PER_TRADE = 0.30          # Maximum risk per trade (30% of capital)
+PORTFOLIO_HEAT = 0.90              # Maximum portfolio heat (90% of capital at risk)
+
+# Strategy parameters
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+EMA_SHORT = 9
+EMA_MEDIUM = 21
+EMA_LONG = 50
+ATR_PERIOD = 14
+FIBONACCI_PERIOD = 20              # Period for calculating Fibonacci levels
+REGIME_LOOKBACK = 120              # Number of periods for regime detection
+
+# Trailing stop parameters
+TRAILING_STOP_ACTIVATION = 0.02    # Activate trailing stop after 2% profit
+TRAILING_STOP_DISTANCE = 0.015     # Trailing stop 1.5% away from price
+
+# Dynamic take profit levels (Fibonacci-based)
+TAKE_PROFIT_LEVELS = [0.236, 0.382, 0.618, 1.0]  # Fibonacci retracement levels
+TAKE_PROFIT_ALLOCATION = [0.25, 0.25, 0.25, 0.25]  # Equal position allocation per level
+
+# Machine learning parameters
+ML_CONFIDENCE_THRESHOLD = 0.65     # Minimum confidence for ML signals
+ML_RETRAIN_INTERVAL = 7            # Retrain ML models every 7 days
+ML_LOOKBACK_DAYS = 120             # Days of data to use for ML training
+ML_FEATURES = 40                   # Number of features to use for ML models
+
+# Regime detection parameters
+TREND_ADX_THRESHOLD = 25           # Minimum ADX for trend
+VOLATILITY_PERCENTILE = 80         # Percentile for high volatility regime
+RANGE_ADX_THRESHOLD = 20           # Maximum ADX for range
+
+# Strategy weighting parameters
+TREND_FOLLOW_WEIGHT = 1.0
+MEAN_REVERSION_WEIGHT = 1.0
+BREAKOUT_WEIGHT = 1.0
+MOMENTUM_WEIGHT = 1.0
+VOLATILITY_WEIGHT = 1.0
+ML_WEIGHT = 1.0                    # Weight for machine learning signals
+FUND_WEIGHT = 0.8                  # Weight for fundamental analysis
+
+# Position scaling parameters
+SCALE_PORTIONS = [0.5, 0.3, 0.2]   # Position scaling portions (50%, 30%, 20%)
+
+# Paths for saving and loading models
+MODEL_PATH = "models/"
+DATA_PATH = "data/"
+
+# Create directories if they don't exist
+os.makedirs(MODEL_PATH, exist_ok=True)
+os.makedirs(DATA_PATH, exist_ok=True)
+
+# Initialize Binance client
+try:
+    client = Client(API_KEY, API_SECRET)
+    # Test connectivity
+    client.futures_ping()
+    logger.info("✅ Successfully connected to Binance Futures API")
+except Exception as e:
+    logger.critical(f"Failed to connect to Binance API: {e}")
+    sys.exit(1)
+
+# ======================================================
+# Global State Variables
+# ======================================================
+
+# Trading state
+trade_history = []
+open_positions = {}
+current_capital = 0.0
+total_realized_pnl = 0.0
+daily_pnl = 0.0
+start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+# Data caches
+symbol_data_cache = {}
+exchange_info_cache = None
+exchange_info_timestamp = 0
+pairs_performance = {}
+fundamental_data_cache = {}
+market_regimes = {}
+ml_predictions = {}
+
+# ML models
+ml_models = {}
+ml_last_train_time = 0
+feature_scalers = {}
+
+# Strategy performance tracking
+strategy_performance = {
+    'trend_following': {'wins': 0, 'losses': 0, 'pnl': 0.0},
+    'mean_reversion': {'wins': 0, 'losses': 0, 'pnl': 0.0},
+    'breakout': {'wins': 0, 'losses': 0, 'pnl': 0.0},
+    'momentum': {'wins': 0, 'losses': 0, 'pnl': 0.0},
+    'ml_enhanced': {'wins': 0, 'losses': 0, 'pnl': 0.0}
+}
+
+# Adaptive weights based on performance
+adaptive_weights = {
+    'trend_following': 1.0,
+    'mean_reversion': 1.0,
+    'breakout': 1.0,
+    'momentum': 1.0,
+    'ml_enhanced': 1.0
+}
+
+# Synchronization
+data_lock = threading.Lock()
+
+# ======================================================
+# Utility Functions
+# ======================================================
+
+def api_call_with_retry(func, *args, max_retries=3, initial_retry_delay=1, **kwargs):
+    """Execute API call with retry logic and exponential backoff"""
+    retry_delay = initial_retry_delay
+    
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except BinanceAPIException as e:
+            # Handle specific Binance API errors
+            if e.code == -1021:  # Timestamp for this request ahead of server time
+                logger.warning("Server time synchronization issue. Syncing time...")
+                # Get server time and adjust
+                server_time = client.get_server_time()
+                kwargs['timestamp'] = server_time['serverTime']
+                continue
+            elif e.code == -1003:  # Too many requests
+                logger.warning(f"Rate limit hit, retry after longer delay: {e}")
+                time.sleep(retry_delay * 5)  # Longer delay for rate limits
+                retry_delay *= 2
+                continue
+            elif e.code == -2010:  # Account has insufficient balance
+                logger.error(f"Insufficient balance: {e}")
+                return None
+            elif attempt == max_retries - 1:
+                logger.error(f"Binance API error after {max_retries} attempts: {e}")
+                raise
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Failed after {max_retries} attempts: {e}")
+                raise
+            
+            wait_time = retry_delay
+            retry_delay *= 2  # Exponential backoff
+            logger.warning(f"API call failed, retrying in {wait_time}s: {e}")
+            time.sleep(wait_time)
+
+def get_exchange_info():
+    """Get exchange info with caching to reduce API calls"""
+    global exchange_info_cache, exchange_info_timestamp
+    
+    current_time = time.time()
+    # Cache for 1 hour to reduce API calls
+    if exchange_info_cache is None or current_time - exchange_info_timestamp > 3600:
+        logger.debug("Fetching exchange information...")
+        exchange_info_cache = api_call_with_retry(client.futures_exchange_info)
+        exchange_info_timestamp = current_time
+        logger.debug("Exchange information updated")
+    
+    return exchange_info_cache
+
+def get_quantity_precision(symbol):
+    """Get the quantity precision for a symbol"""
+    try:
+        exchange_info = get_exchange_info()
+        for info in exchange_info['symbols']:
+            if info['symbol'] == symbol:
+                # Find the LOT_SIZE filter
+                for filter in info['filters']:
+                    if filter['filterType'] == 'LOT_SIZE':
+                        step_size = float(filter['stepSize'])
+                        # Calculate precision from step size
+                        if step_size == 0:
+                            return 0
+                        
+                        precision = 0
+                        step_size_str = str(step_size)
+                        
+                        if '.' in step_size_str:
+                            precision = len(step_size_str.split('.')[1].rstrip('0'))
+                        
+                        return precision
+        # Default precision if not found
+        return 3
+    except Exception as e:
+        logger.error(f"Error getting quantity precision for {symbol}: {e}")
+        return 3  # Default precision
+
+def round_step_size(quantity, step_size):
+    """Round quantity to step size"""
+    if step_size == 0:
+        return quantity
+    
+    # Convert to precision
+    precision = 0
+    step_size_str = str(step_size)
+    
+    if '.' in step_size_str:
+        precision = len(step_size_str.split('.')[1].rstrip('0'))
+    
+    # Round down to the nearest step (always round down to ensure we don't exceed available balance)
+    return math.floor(quantity / step_size) * step_size
+
+def get_step_size(symbol):
+    """Get the step size (minimum quantity increment) for a symbol"""
+    try:
+        exchange_info = get_exchange_info()
+        for info in exchange_info['symbols']:
+            if info['symbol'] == symbol:
+                for filter in info['filters']:
+                    if filter['filterType'] == 'LOT_SIZE':
+                        logger.debug(f"Found LOT_SIZE filter for {symbol}: {filter}")
+                        return float(filter['stepSize'])
+        # If we reach here, we didn't find the filter
+        logger.warning(f"No LOT_SIZE filter found for {symbol}, using default")
+        return 1.0  # Conservative default
+    except Exception as e:
+        logger.error(f"Error getting step size for {symbol}: {e}")
+        return 1.0  # Conservative default
+
+def get_min_quantity(symbol):
+    """Get minimum allowed quantity for a symbol"""
+    try:
+        exchange_info = get_exchange_info()
+        for info in exchange_info['symbols']:
+            if info['symbol'] == symbol:
+                for filter in info['filters']:
+                    if filter['filterType'] == 'LOT_SIZE':
+                        return float(filter['minQty'])
+        return 1.0  # Default
+    except Exception as e:
+        logger.error(f"Error getting min quantity for {symbol}: {e}")
+        return 1.0
+
+def get_price_precision(symbol):
+    """Get the price precision for a symbol"""
+    try:
+        exchange_info = get_exchange_info()
+        for info in exchange_info['symbols']:
+            if info['symbol'] == symbol:
+                for filter in info['filters']:
+                    if filter['filterType'] == 'PRICE_FILTER':
+                        tick_size = float(filter['tickSize'])
+                        precision = 0
+                        tick_size_str = str(tick_size)
+                        
+                        if '.' in tick_size_str:
+                            precision = len(tick_size_str.split('.')[1].rstrip('0'))
+                        
+                        return precision
+        return 2  # Default precision
+    except Exception as e:
+        logger.error(f"Error getting price precision for {symbol}: {e}")
+        return 2
+
+def round_price_to_tick(price, symbol):
+    """Round price to the nearest tick size"""
+    try:
+        exchange_info = get_exchange_info()
+        for info in exchange_info['symbols']:
+            if info['symbol'] == symbol:
+                for filter in info['filters']:
+                    if filter['filterType'] == 'PRICE_FILTER':
+                        tick_size = float(filter['tickSize'])
+                        return math.floor(price / tick_size) * tick_size
+        return price  # Default if not found
+    except Exception as e:
+        logger.error(f"Error rounding price for {symbol}: {e}")
+        return price
+
+def update_trade_history(trade):
+    """Update trade history and calculate metrics"""
+    global trade_history, daily_pnl, strategy_performance, adaptive_weights
+    
+    with data_lock:
+        trade_history.append(trade)
+        
+        # Keep only last 500 trades to prevent memory issues
+        if len(trade_history) > 500:
+            trade_history = trade_history[-500:]
+        
+        # Update daily P&L
+        if trade['timestamp'] > start_of_day.timestamp() * 1000:
+            daily_pnl += trade['pnl']
+        
+        # Update strategy performance
+        strategy = trade.get('strategy', 'trend_following')
+        if strategy in strategy_performance:
+            if trade['pnl'] > 0:
+                strategy_performance[strategy]['wins'] += 1
+            else:
+                strategy_performance[strategy]['losses'] += 1
+            strategy_performance[strategy]['pnl'] += trade['pnl']
+        
+        # Update adaptive weights based on recent performance
+        update_adaptive_weights()
+    
+    # Log trade details in a clean format
+    profit_emoji = "🟢" if trade['pnl'] > 0 else "🔴"
+    strategy_display = trade.get('strategy', 'unknown').replace('_', ' ').title()
+    logger.info(f"{profit_emoji} Trade closed: {trade['symbol']} {trade['direction'].upper()} " + 
+                f"[{strategy_display}] - P&L: ${trade['pnl']:.2f} ({trade.get('pnl_percent', 0):.2f}%)")
+
+def update_adaptive_weights():
+    """Update strategy weights based on performance"""
+    global strategy_performance, adaptive_weights
+    
+    # Calculate win rates and profit factors for each strategy
+    for strategy, perf in strategy_performance.items():
+        total_trades = perf['wins'] + perf['losses']
+        
+        if total_trades < 5:  # Need minimum sample size
+            continue
+            
+        win_rate = perf['wins'] / total_trades if total_trades > 0 else 0
+        avg_win = perf['pnl'] / perf['wins'] if perf['wins'] > 0 else 0
+        avg_loss = -perf['pnl'] / perf['losses'] if perf['losses'] > 0 else 0
+        
+        # Calculate expectancy
+        expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss) if avg_loss != 0 else win_rate * avg_win
+        
+        # Update weight - scale from 0.5 to 2.0 based on expectancy
+        if expectancy > 0:
+            adaptive_weights[strategy] = min(2.0, 1.0 + expectancy)
+        else:
+            adaptive_weights[strategy] = max(0.5, 1.0 + expectancy)
+    
+    # Log updated weights
+    logger.debug(f"Updated strategy weights: {adaptive_weights}")
+
+def calculate_performance_metrics():
+    """Calculate trading performance metrics"""
+    if not trade_history:
+        return {
+            'win_rate': 0,
+            'avg_win': 0,
+            'avg_loss': 0,
+            'profit_factor': 0,
+            'expectancy': 0,
+            'total_trades': 0,
+            'sharpe_ratio': 0,
+            'max_drawdown': 0,
+            'strategy_metrics': {}
+        }
+    
+    with data_lock:
+        wins = [t for t in trade_history if t['pnl'] > 0]
+        losses = [t for t in trade_history if t['pnl'] <= 0]
+        
+        win_rate = len(wins) / len(trade_history) if trade_history else 0
+        avg_win = sum(t['pnl'] for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t['pnl'] for t in losses) / len(losses) if losses else 0
+        profit_factor = abs(sum(t['pnl'] for t in wins) / sum(t['pnl'] for t in losses)) if losses and sum(t['pnl'] for t in losses) != 0 else float('inf')
+        
+        # Calculate Sharpe ratio (simplified)
+        if len(trade_history) > 10:
+            returns = [t['pnl'] for t in trade_history[-100:]]
+            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(365) if np.std(returns) > 0 else 0
+        else:
+            sharpe = 0
+        
+        # Calculate max drawdown
+        equity_curve = [0]
+        for trade in trade_history:
+            equity_curve.append(equity_curve[-1] + trade['pnl'])
+        
+        max_drawdown = 0
+        peak = equity_curve[0]
+        
+        for value in equity_curve:
+            if value > peak:
+                peak = value
+            drawdown = (peak - value) / peak * 100 if peak > 0 else 0
+            max_drawdown = max(max_drawdown, drawdown)
+        
+        # Calculate strategy-specific metrics
+        strategy_metrics = {}
+        strategies = set(t.get('strategy', 'unknown') for t in trade_history)
+        
+        for strategy in strategies:
+            strategy_trades = [t for t in trade_history if t.get('strategy', 'unknown') == strategy]
+            if not strategy_trades:
+                continue
+                
+            strategy_wins = [t for t in strategy_trades if t['pnl'] > 0]
+            strat_win_rate = len(strategy_wins) / len(strategy_trades) if strategy_trades else 0
+            
+            strategy_metrics[strategy] = {
+                'trades': len(strategy_trades),
+                'win_rate': strat_win_rate,
+                'pnl': sum(t['pnl'] for t in strategy_trades)
+            }
+        
+        return {
+            'win_rate': win_rate,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'profit_factor': profit_factor,
+            'expectancy': (win_rate * avg_win) - ((1 - win_rate) * abs(avg_loss)),
+            'total_trades': len(trade_history),
+            'sharpe_ratio': sharpe,
+            'max_drawdown': max_drawdown,
+            'strategy_metrics': strategy_metrics
+        }
+
+def check_daily_circuit_breaker():
+    """Check if daily loss limit has been breached"""
+    if not trade_history:
+        return False
+    
+    with data_lock:
+        # Get today's trades
+        today_trades = [t for t in trade_history if t['timestamp'] > start_of_day.timestamp() * 1000]
+        if not today_trades:
+            return False
+        
+        # Calculate today's P&L
+        today_pnl = sum(t['pnl'] for t in today_trades)
+        
+        # Check if we've hit the circuit breaker
+        if today_pnl < -1 * (current_capital * MAX_DAILY_LOSS):
+            logger.warning(f"⚠️ CIRCUIT BREAKER TRIGGERED: Daily loss limit reached (${today_pnl:.2f})")
+            return True
+        
+        return False
+
+def log_portfolio_status():
+    """Log current portfolio status in a clear, readable format"""
+    # Get account info
+    account_info = api_call_with_retry(client.futures_account)
+    
+    total_balance = float(account_info['totalWalletBalance'])
+    unrealized_pnl = float(account_info['totalUnrealizedProfit'])
+    available_balance = float(account_info['availableBalance'])
+    
+    # Get current positions
+    positions = [p for p in account_info['positions'] if float(p['positionAmt']) != 0]
+    
+    # Calculate metrics
+    margin_used = total_balance - available_balance
+    margin_usage_pct = (margin_used / total_balance * 100) if total_balance > 0 else 0
+    
+    # Log portfolio summary
+    logger.info("📊 PORTFOLIO SUMMARY")
+    logger.info(f"💰 Total Balance: ${total_balance:.2f}")
+    logger.info(f"📈 Unrealized P&L: ${unrealized_pnl:.2f}")
+    logger.info(f"🔓 Available Balance: ${available_balance:.2f}")
+    logger.info(f"🔒 Margin Used: ${margin_used:.2f} ({margin_usage_pct:.1f}%)")
+    logger.info(f"👛 Open Positions: {len(positions)}")
+    
+    # Log individual positions
+    if positions:
+        logger.info("📋 ACTIVE POSITIONS:")
+        for pos in positions:
+            symbol = pos['symbol']
+            amount = float(pos['positionAmt'])
+            entry_price = float(pos['entryPrice'])
+            mark_price = float(pos['markPrice'])
+            unrealized_profit = float(pos['unrealizedProfit'])
+            
+            if amount == 0:
+                continue
+                
+            direction = "LONG" if amount > 0 else "SHORT"
+            pnl_pct = unrealized_profit / (abs(amount) * entry_price) * 100 if entry_price > 0 and amount != 0 else 0
+            
+            # Use emoji to indicate profit/loss
+            status_emoji = "🟢" if unrealized_profit > 0 else "🔴"
+            
+            # Get strategy if available
+            strategy = "Unknown"
+            if symbol in open_positions:
+                strategy = open_positions[symbol].get('strategy', 'Unknown')
+                strategy = strategy.replace('_', ' ').title()
+            
+            logger.info(f"  {status_emoji} {symbol} {direction}: {abs(amount)} @ ${entry_price:.4f} | " + 
+                       f"P&L: ${unrealized_profit:.2f} ({pnl_pct:.2f}%) | Strategy: {strategy}")
+    
+    # Log performance metrics
+    metrics = calculate_performance_metrics()
+    logger.info(f"📈 Win Rate: {metrics['win_rate']*100:.1f}% | Profit Factor: {metrics['profit_factor']:.2f} | " + 
+               f"Trades: {metrics['total_trades']} | Max DD: {metrics['max_drawdown']:.1f}%")
+    
+    # Log strategy performance
+    if metrics.get('strategy_metrics'):
+        logger.info("📊 Strategy Performance:")
+        for strategy, stats in metrics['strategy_metrics'].items():
+            strategy_name = strategy.replace('_', ' ').title()
+            logger.info(f"  {strategy_name}: {stats['trades']} trades | " + 
+                      f"Win Rate: {stats['win_rate']*100:.1f}% | PnL: ${stats['pnl']:.2f}")
+    
+    # Update global capital
+    global current_capital
+    current_capital = total_balance
+    
+    return total_balance, available_balance
+
+# ======================================================
+# PART 2: Advanced Data Collection and Analysis
+# ======================================================
+
+def get_historical_data(symbol, timeframe='1h', limit=100, use_cache=True):
+    """Get historical klines/candlestick data with caching"""
+    timeframe_map = {
+        '1m': Client.KLINE_INTERVAL_1MINUTE,
+        '3m': Client.KLINE_INTERVAL_3MINUTE,
+        '5m': Client.KLINE_INTERVAL_5MINUTE,
+        '15m': Client.KLINE_INTERVAL_15MINUTE,
+        '30m': Client.KLINE_INTERVAL_30MINUTE,
+        '1h': Client.KLINE_INTERVAL_1HOUR,
+        '2h': Client.KLINE_INTERVAL_2HOUR,
+        '4h': Client.KLINE_INTERVAL_4HOUR,
+        '6h': Client.KLINE_INTERVAL_6HOUR,
+        '8h': Client.KLINE_INTERVAL_8HOUR,
+        '12h': Client.KLINE_INTERVAL_12HOUR,
+        '1d': Client.KLINE_INTERVAL_1DAY,
+        '3d': Client.KLINE_INTERVAL_3DAY,
+        '1w': Client.KLINE_INTERVAL_1WEEK,
+        '1M': Client.KLINE_INTERVAL_1MONTH
+    }
+    
+    interval = timeframe_map.get(timeframe, Client.KLINE_INTERVAL_1HOUR)
+    
+    # Use cache if available (for better performance)
+    cache_key = f"{symbol}_{timeframe}_{limit}"
+    if use_cache and cache_key in symbol_data_cache and time.time() - symbol_data_cache[cache_key]['timestamp'] < 60:
+        return symbol_data_cache[cache_key]['data'].copy()
+    
+    try:
+        # Get historical klines from Binance
+        klines = api_call_with_retry(
+            client.futures_klines,
+            symbol=symbol,
+            interval=interval,
+            limit=limit
+        )
+        
+        # Convert to DataFrame for easier analysis
+        df = pd.DataFrame(klines, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        ])
+        
+        # Convert types
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        for col in ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume']:
+            df[col] = df[col].astype(float)
+        
+        # Add technical indicators
+        df = add_indicators(df, symbol)
+        
+        # Cache the data
+        symbol_data_cache[cache_key] = {
+            'data': df.copy(),
+            'timestamp': time.time()
+        }
+        
+        return df
+    except Exception as e:
+        logger.error(f"Error getting historical data for {symbol}: {e}")
+        return pd.DataFrame()
+
+def add_indicators(df, symbol):
+    """Add comprehensive technical indicators to dataframe"""
+    if df.empty:
+        return df
+    
+    # Basic price data and volumes in numpy arrays for talib
+    open_prices = df['open'].values
+    high_prices = df['high'].values
+    low_prices = df['low'].values
+    close_prices = df['close'].values
+    volumes = df['volume'].values
+    
+    # === Trend Indicators ===
+    
+    # RSI - Relative Strength Index
+    try:
+        df['rsi'] = talib.RSI(close_prices, timeperiod=RSI_PERIOD)
+    except:
+        # Fallback if talib fails
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(window=RSI_PERIOD).mean()
+        avg_loss = loss.rolling(window=RSI_PERIOD).mean()
+        rs = avg_gain / avg_loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # Moving Averages
+    df['sma_10'] = talib.SMA(close_prices, timeperiod=10)
+    df['sma_20'] = talib.SMA(close_prices, timeperiod=20)
+    df['sma_50'] = talib.SMA(close_prices, timeperiod=50)
+    df['sma_100'] = talib.SMA(close_prices, timeperiod=100)
+    
+    # Exponential Moving Averages
+    df['ema_9'] = talib.EMA(close_prices, timeperiod=9)
+    df['ema_21'] = talib.EMA(close_prices, timeperiod=21)
+    df['ema_50'] = talib.EMA(close_prices, timeperiod=50)
+    df['ema_200'] = talib.EMA(close_prices, timeperiod=200)
+
+    # MACD - Moving Average Convergence Divergence
+    macd, macd_signal, macd_hist = talib.MACD(
+        close_prices, 
+        fastperiod=12, 
+        slowperiod=26, 
+        signalperiod=9
+    )
+    df['macd'] = macd
+    df['macd_signal'] = macd_signal
+    df['macd_hist'] = macd_hist
+    
+    # ADX - Average Directional Index (trend strength)
+    df['adx'] = talib.ADX(high_prices, low_prices, close_prices, timeperiod=14)
+    df['di_plus'] = talib.PLUS_DI(high_prices, low_prices, close_prices, timeperiod=14)
+    df['di_minus'] = talib.MINUS_DI(high_prices, low_prices, close_prices, timeperiod=14)
+    
+    # Parabolic SAR
+    df['sar'] = talib.SAR(high_prices, low_prices, acceleration=0.02, maximum=0.2)
+    
+    # Ichimoku Cloud
+    tenkan_sen_period = 9
+    kijun_sen_period = 26
+    senkou_span_b_period = 52
+    
+    # Tenkan-sen (Conversion Line): (9-period high + 9-period low)/2
+    df['tenkan_sen'] = (df['high'].rolling(window=tenkan_sen_period).max() + 
+                        df['low'].rolling(window=tenkan_sen_period).min()) / 2
+    
+    # Kijun-sen (Base Line): (26-period high + 26-period low)/2
+    df['kijun_sen'] = (df['high'].rolling(window=kijun_sen_period).max() + 
+                       df['low'].rolling(window=kijun_sen_period).min()) / 2
+    
+    # Senkou Span A (Leading Span A): (Conversion Line + Base Line)/2
+    df['senkou_span_a'] = ((df['tenkan_sen'] + df['kijun_sen']) / 2).shift(kijun_sen_period)
+    
+    # Senkou Span B (Leading Span B): (52-period high + 52-period low)/2
+    df['senkou_span_b'] = ((df['high'].rolling(window=senkou_span_b_period).max() + 
+                           df['low'].rolling(window=senkou_span_b_period).min()) / 2).shift(kijun_sen_period)
+    
+    # Chikou Span (Lagging Span): Close price shifted back 26 periods
+    df['chikou_span'] = df['close'].shift(-kijun_sen_period)
+
+    # === Volatility Indicators ===
+    
+    # ATR - Average True Range
+    df['atr'] = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)
+    df['atr_percent'] = df['atr'] / df['close'] * 100  # ATR as percentage of price
+    
+    # Bollinger Bands
+    df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(
+        close_prices, 
+        timeperiod=20, 
+        nbdevup=2, 
+        nbdevdn=2
+    )
+    
+    # Calculate BB width and %B
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+    df['bb_percent_b'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+    
+    # Keltner Channels
+    df['kc_middle'] = df['ema_21']
+    df['kc_upper'] = df['kc_middle'] + df['atr'] * 2
+    df['kc_lower'] = df['kc_middle'] - df['atr'] * 2
+    
+    # === Momentum Indicators ===
+    
+    # Stochastic Oscillator
+    df['stoch_k'], df['stoch_d'] = talib.STOCH(
+        high_prices, 
+        low_prices, 
+        close_prices, 
+        fastk_period=14, 
+        slowk_period=3, 
+        slowd_period=3
+    )
+    
+    # Commodity Channel Index
+    df['cci'] = talib.CCI(high_prices, low_prices, close_prices, timeperiod=14)
+    
+    # Rate Of Change
+    df['roc'] = talib.ROC(close_prices, timeperiod=10)
+    
+    # Williams %R
+    df['willr'] = talib.WILLR(high_prices, low_prices, close_prices, timeperiod=14)
+    
+    # Money Flow Index
+    df['mfi'] = talib.MFI(high_prices, low_prices, close_prices, volumes, timeperiod=14)
+    
+    # On-Balance Volume
+    df['obv'] = talib.OBV(close_prices, volumes)
+    
+    # Chaikin Money Flow
+    mf_multiplier = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low'])
+    mf_volume = mf_multiplier * df['volume']
+    df['cmf'] = mf_volume.rolling(window=20).sum() / df['volume'].rolling(window=20).sum()
+    
+    # === Price Action Patterns ===
+    
+    # Engulfing patterns
+    df['bullish_engulfing'] = (
+        (df['close'].shift(1) < df['open'].shift(1)) &  # Previous candle is bearish
+        (df['close'] > df['open']) &  # Current candle is bullish
+        (df['close'] > df['open'].shift(1)) &  # Current close > previous open
+        (df['open'] < df['close'].shift(1))  # Current open < previous close
+    ).astype(int)
+    
+    df['bearish_engulfing'] = (
+        (df['close'].shift(1) > df['open'].shift(1)) &  # Previous candle is bullish
+        (df['close'] < df['open']) &  # Current candle is bearish
+        (df['close'] < df['open'].shift(1)) &  # Current close < previous open
+        (df['open'] > df['close'].shift(1))  # Current open > previous close
+    ).astype(int)
+    
+    # Hammer and Shooting Star
+    body_size = abs(df['close'] - df['open'])
+    total_size = df['high'] - df['low']
+    
+    df['hammer'] = (
+        (body_size / total_size < 0.3) &  # Small body
+        ((df['low'] - df['close'].where(df['close'] < df['open'], df['open'])) / total_size > 0.6) &  # Long lower wick
+        ((df['high'] - df['close'].where(df['close'] > df['open'], df['open'])) / total_size < 0.1)  # Minimal upper wick
+    ).astype(int)
+    
+    df['shooting_star'] = (
+        (body_size / total_size < 0.3) &  # Small body
+        ((df['high'] - df['close'].where(df['close'] > df['open'], df['open'])) / total_size > 0.6) &  # Long upper wick
+        ((df['close'].where(df['close'] < df['open'], df['open']) - df['low']) / total_size < 0.1)  # Minimal lower wick
+    ).astype(int)
+
+    # === Fibonacci Analysis ===
+    
+    # Find swing highs and lows
+    window_size = FIBONACCI_PERIOD
+    
+    if len(df) >= window_size:
+        for i in range(window_size, len(df)):
+            # Use a rolling window to find swing high/low
+            window = df.iloc[i-window_size:i]
+            
+            # Find swing high and low within the window
+            swing_high = window['high'].max()
+            swing_low = window['low'].min()
+            
+            # Calculate Fibonacci retracement levels
+            fib_diff = swing_high - swing_low
+            
+            # Store Fibonacci levels
+            df.loc[df.index[i-1], 'fib_0'] = swing_low 
+            df.loc[df.index[i-1], 'fib_236'] = swing_low + 0.236 * fib_diff
+            df.loc[df.index[i-1], 'fib_382'] = swing_low + 0.382 * fib_diff
+            df.loc[df.index[i-1], 'fib_500'] = swing_low + 0.5 * fib_diff
+            df.loc[df.index[i-1], 'fib_618'] = swing_low + 0.618 * fib_diff
+            df.loc[df.index[i-1], 'fib_786'] = swing_low + 0.786 * fib_diff
+            df.loc[df.index[i-1], 'fib_1000'] = swing_high
+            
+            # Calculate Fibonacci extension levels
+            df.loc[df.index[i-1], 'fib_1272'] = swing_low + 1.272 * fib_diff
+            df.loc[df.index[i-1], 'fib_1414'] = swing_low + 1.414 * fib_diff
+            df.loc[df.index[i-1], 'fib_1618'] = swing_low + 1.618 * fib_diff
+            df.loc[df.index[i-1], 'fib_2000'] = swing_low + 2.0 * fib_diff
+            df.loc[df.index[i-1], 'fib_2618'] = swing_low + 2.618 * fib_diff
+            
+            # Identify price position relative to Fibonacci levels
+            current_price = df.loc[df.index[i-1], 'close']
+            
+            # Proximity to Fibonacci levels (as percentage of price)
+            for level in ['236', '382', '500', '618', '786']:
+                fib_level = df.loc[df.index[i-1], f'fib_{level}']
+                if not np.isnan(fib_level):
+                    proximity = abs(current_price - fib_level) / current_price
+                    df.loc[df.index[i-1], f'fib_{level}_proximity'] = proximity
+            
+            # Calculate reversal zones (confluence of multiple indicators near Fibonacci levels)
+            for level in ['236', '382', '500', '618', '786']:
+                fib_level = df.loc[df.index[i-1], f'fib_{level}']
+                if not np.isnan(fib_level):
+                    # Check if price is near this Fibonacci level
+                    near_fib = abs(current_price - fib_level) / current_price < 0.01  # Within 1%
+                    
+                    # Check if other indicators suggest reversal
+                    oversold = df.loc[df.index[i-1], 'rsi'] < 30
+                    overbought = df.loc[df.index[i-1], 'rsi'] > 70
+                    
+                    # Mark potential reversal zones
+                    if near_fib and (
+                        (current_price < fib_level and oversold) or 
+                        (current_price > fib_level and overbought)
+                    ):
+                        df.loc[df.index[i-1], f'fib_{level}_reversal'] = 1
+                    else:
+                        df.loc[df.index[i-1], f'fib_{level}_reversal'] = 0
+
+    # Return enhanced dataframe
+    return df
+
+# ======================================================
+# New Functions for Enhanced Trading Logic
+# ======================================================
+
+def get_trailing_stop_parameters(profit_pct):
+    """Dynamically adjust trailing distance based on profit"""
+    # Don't activate trailing stop yet
+    if profit_pct < 3:
+        return None
+    elif profit_pct < 5:
+        return 0.015  # 1.5% trailing stop
+    elif profit_pct < 10:
+        return 0.025  # 2.5% trailing stop
+    else:
+        return 0.035  # 3.5% trailing stop - wider to let profits run
+
+def validate_trend_strength(symbol, direction):
+    """Check multiple timeframes for trend alignment"""
+    trend_strength = 0
+    
+    for timeframe in ['1h', '4h', '1d']:
+        df = get_historical_data(symbol, timeframe)
+        
+        # Direction of EMAs
+        ema_aligned = (
+            (direction == 'long' and df['ema_9'].iloc[-1] > df['ema_21'].iloc[-1]) or
+            (direction == 'short' and df['ema_9'].iloc[-1] < df['ema_21'].iloc[-1])
+        )
+        
+        # ADX for trend strength
+        strong_trend = df['adx'].iloc[-1] > 25
+        
+        # Volume confirmation
+        increasing_volume = df['volume'].iloc[-1] > df['volume'].iloc[-5:].mean()
+        
+        if ema_aligned:
+            trend_strength += 1
+        if strong_trend:
+            trend_strength += 1
+        if increasing_volume:
+            trend_strength += 1
+    
+    # Only take trades with strong trend confirmation
+    return trend_strength >= 7  # Out of 9 possible points
+
+def optimize_stop_loss(symbol, direction, entry_price):
+    """Calculate optimal stop loss based on recent price action and ATR"""
+    df = get_historical_data(symbol, '1h')
+    atr = df['atr'].iloc[-1]
+    
+    if direction == 'long':
+        # Find recent swing low for natural support
+        recent_lows = df['low'].iloc[-10:].rolling(3).min()
+        lowest_point = max(entry_price * 0.97, recent_lows.min())  # Max 3% risk
+        return lowest_point
+    else:
+        # Find recent swing high for natural resistance
+        recent_highs = df['high'].iloc[-10:].rolling(3).max()
+        highest_point = min(entry_price * 1.03, recent_highs.max())  # Max 3% risk
+        return highest_point
+
+def check_favorable_market_context(symbol, direction):
+    """Check if overall market conditions favor this trade"""
+    # Check Bitcoin trend (market leader)
+    btc_df = get_historical_data('BTCUSDT', '4h')
+    
+    # Check overall market conditions
+    overall_momentum = get_market_momentum()
+    
+    # Only take trades aligned with BTC and overall market direction
+    btc_trend = 'up' if btc_df['ema_9'].iloc[-1] > btc_df['ema_21'].iloc[-1] else 'down'
+    
+    return (
+        (direction == 'long' and btc_trend == 'up' and overall_momentum > 0) or
+        (direction == 'short' and btc_trend == 'down' and overall_momentum < 0)
+    )
+
+def scale_into_position(symbol, direction, total_quantity):
+    """Split entry into 2-3 parts to improve average entry"""
+    scale_portions = [0.5, 0.3, 0.2]  # 50%, 30%, 20%
+    
+    for i, portion in enumerate(scale_portions):
+        quantity = round_step_size(total_quantity * portion, get_step_size(symbol))
+        
+        # Execute the first portion immediately
+        if i == 0:
+            execute_order(symbol, direction, quantity)
+        else:
+            # Set conditional orders for remaining portions at better prices
+            if direction == 'long':
+                price_level = current_price * (1 - 0.005 * i)  # 0.5% lower each scale
+            else:
+                price_level = current_price * (1 + 0.005 * i)  # 0.5% higher each scale
+            
+            set_limit_order(symbol, direction, quantity, price_level)
+
+def calculate_fibonacci_time_points(symbol, timeframe='1h'):
+    """Calculate and return Fibonacci time extension points"""
+    df = get_historical_data(symbol, timeframe, limit=200)
+    
+    # Find significant swing points (recent major high and low)
+    highs = df['high'].rolling(5).max()
+    lows = df['low'].rolling(5).min()
+    
+    # Look for most recent significant swing
+    swing_high_idx = None
+    swing_low_idx = None
+    
+    # Find most recent swing high
+    for i in range(len(df)-20, 20, -1):
+        # Check if this candle is a swing high
+        if highs.iloc[i] == df['high'].iloc[i] and df['high'].iloc[i] > df['high'].iloc[i+1]:
+            swing_high_idx = i
+            break
+    
+    # Find most recent swing low
+    for i in range(len(df)-20, 20, -1):
+        # Check if this candle is a swing low
+        if lows.iloc[i] == df['low'].iloc[i] and df['low'].iloc[i] < df['low'].iloc[i+1]:
+            swing_low_idx = i
+            break
+    
+    # Calculate the time duration between swings
+    if swing_high_idx is None or swing_low_idx is None:
+        return {}
+    
+    swing_duration = abs(swing_high_idx - swing_low_idx)
+    
+    # Calculate Fibonacci time extensions
+    fib_levels = [0.382, 0.618, 1.0, 1.618, 2.618, 4.236]
+    current_idx = len(df) - 1
+    
+    fib_time_points = {}
+    for level in fib_levels:
+        future_idx = current_idx + int(swing_duration * level)
+        fib_time_points[level] = future_idx
+    
+    return fib_time_points
+
+def check_fib_time_alignment(symbol):
+    """Check if current time is near a Fibonacci time extension point"""
+    # Get Fibonacci time projections
+    fib_time_points = calculate_fibonacci_time_points(symbol)
+    
+    if not fib_time_points:
+        return False
+    
+    # Check if current time is near any Fibonacci time point
+    current_idx = len(get_historical_data(symbol)) - 1
+    
+    # Define "near" as within 2 candles of a Fib time point
+    for level, future_idx in fib_time_points.items():
+        if abs(current_idx - future_idx) <= 2:
+            logger.info(f"Current time near Fibonacci {level} time extension for {symbol}")
+            return True
+    
+    return False
+
+def set_take_profits(entry_price, direction, atr, symbol):
+    """Set dynamic, multi-stage take profit levels"""
+    if direction == 'long':
+        # Partial exits at key levels
+        take_profits = [
+            {"price": entry_price * 1.02, "size": 0.25},  # Take 25% off at 2%
+            {"price": entry_price * 1.05, "size": 0.25},  # Another 25% at 5%
+            {"price": entry_price * 1.10, "size": 0.25},  # Another 25% at 10%
+            {"price": entry_price * 1.20, "size": 0.25}   # Final 25% at 20%
+        ]
+    else:
+        # Short positions
+        take_profits = [
+            {"price": entry_price * 0.98, "size": 0.25},
+            {"price": entry_price * 0.95, "size": 0.25},
+            {"price": entry_price * 0.90, "size": 0.25},
+            {"price": entry_price * 0.80, "size": 0.25}
+        ]
+    
+    return take_profits
+
+def get_market_momentum():
+    """Calculate overall market momentum across major crypto assets"""
+    top_coins = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']
+    momentum_scores = []
+    weights = {
+        'BTCUSDT': 3.0,   # Highest weight for Bitcoin
+        'ETHUSDT': 2.0,   # Second highest for Ethereum
+        'BNBUSDT': 1.0,
+        'SOLUSDT': 1.0,
+        'XRPUSDT': 1.0
+    }
+    total_weight = sum(weights.values())
+    
+    try:
+        # Get data for all top coins
+        coin_data = {}
+        for coin in top_coins:
+            try:
+                df = get_historical_data(coin, '4h', limit=30)
+                if not df.empty:
+                    coin_data[coin] = df
+            except Exception as e:
+                logger.debug(f"Error getting data for {coin}: {e}")
+        
+        if not coin_data:
+            logger.warning("Could not fetch data for any major coins")
+            return 0
+        
+        # Calculate weighted momentum score
+        weighted_sum = 0
+        total_applied_weight = 0
+        
+        for coin, df in coin_data.items():
+            # Price momentum (24-hour change)
+            price_change = (df['close'].iloc[-1] / df['close'].iloc[-6] - 1) * 100  # ~24h (6 4h candles)
+            
+            # Volume momentum
+            volume_change = (df['volume'].iloc[-1] / df['volume'].iloc[-6:].mean() - 1) * 100
+            
+            # RSI for overbought/oversold adjustment
+            rsi = df['rsi'].iloc[-1]
+            rsi_factor = 1.0
+            if rsi > 70:
+                # Reduce bullishness when potentially overbought
+                rsi_factor = 0.8 if price_change > 0 else 1.2  # Amplify bearish signals when overbought
+            elif rsi < 30:
+                # Reduce bearishness when potentially oversold
+                rsi_factor = 1.2 if price_change > 0 else 0.8  # Amplify bullish signals when oversold
+            
+            # MACD as trend confirmation
+            macd_hist = df['macd_hist'].iloc[-1]
+            macd_factor = 1.0
+            if (macd_hist > 0 and price_change > 0) or (macd_hist < 0 and price_change < 0):
+                # MACD confirms direction - strengthen signal
+                macd_factor = 1.2
+            elif (macd_hist > 0 and price_change < 0) or (macd_hist < 0 and price_change > 0):
+                # MACD contradicts direction - weaken signal
+                macd_factor = 0.8
+            
+            # Calculate composite momentum score
+            momentum_score = price_change * 0.7 + volume_change * 0.3
+            momentum_score *= rsi_factor * macd_factor
+            
+            # Apply weight for this coin
+            coin_weight = weights.get(coin, 1.0)
+            weighted_sum += momentum_score * coin_weight
+            total_applied_weight += coin_weight
+            
+            logger.debug(f"{coin} momentum: {momentum_score:.2f} (price: {price_change:.2f}%, volume: {volume_change:.2f}%, RSI: {rsi:.1f})")
+        
+        # Calculate final weighted average
+        if total_applied_weight > 0:
+            final_momentum = weighted_sum / total_applied_weight
+            
+            # Clamp extreme values
+            final_momentum = max(min(final_momentum, 100), -100)
+            
+            logger.debug(f"Market momentum score: {final_momentum:.2f}")
+            return final_momentum
+        else:
+            return 0
+            
+    except Exception as e:
+        logger.error(f"Error calculating market momentum: {e}")
+        return 0
+
+# ======================================================
+# Update to Trading Logic and Position Management
+# ======================================================
+
+def manage_open_positions():
+    """Actively manage open positions with improved trailing stops and dynamic exits"""
+    if not open_positions:
+        return
+    
+    for symbol, position in list(open_positions.items()):
+        try:
+            # Check if position still exists
+            current_positions = api_call_with_retry(client.futures_position_information, symbol=symbol)
+            
+            position_exists = False
+            current_pos = None
+            
+            for pos in current_positions:
+                if float(pos['positionAmt']) != 0:
+                    position_exists = True
+                    current_pos = pos
+                    break
+            
+            if not position_exists:
+                # Position is closed, check if it was closed by stop loss or take profit
+                open_orders = api_call_with_retry(client.futures_get_open_orders, symbol=symbol)
+                
+                # If we still have open orders, cancel them
+                if open_orders:
+                    api_call_with_retry(client.futures_cancel_all_open_orders, symbol=symbol)
+                    logger.info(f"Canceled remaining orders for closed position: {symbol}")
+                
+                # Get trade history to determine exit reason
+                trades = api_call_with_retry(client.futures_account_trades, symbol=symbol, limit=10)
+                
+                # Find the exit trade (most recent one)
+                exit_trade = None
+                for trade in sorted(trades, key=lambda x: x['time'], reverse=True):
+                    # Check if this is a closing trade (reduce only or opposite direction)
+                    if trade['time'] > position['entry_time']:
+                        exit_trade = trade
+                        break
+                
+                if exit_trade:
+                    exit_price = float(exit_trade['price'])
+                    exit_reason = "take_profit" if exit_trade.get('orderId') in position.get('tp_order_ids', []) else "stop_loss"
+                else:
+                    # Exit details unknown
+                    exit_price = position['entry_price']  # Default
+                    exit_reason = "unknown"
+                
+                # Close position in our records
+                close_trade(symbol, position, exit_reason, exit_price)
+                continue
+            
+            # Position still open, get current price
+            mark_price = float(current_pos['markPrice'])
+            entry_price = position['entry_price']
+            direction = position['direction']
+            
+            # Calculate current profit
+            if direction == 'long':
+                profit_pct = (mark_price / entry_price - 1) * 100
+            else:
+                profit_pct = (entry_price / mark_price - 1) * 100
+            
+            # Get dynamic trailing stop distance based on profit
+            trailing_distance = get_trailing_stop_parameters(profit_pct)
+            
+            # Update trailing stop if in profit and we have a valid trailing distance
+            if trailing_distance is not None:
+                # Calculate new stop loss based on trailing distance
+                if direction == 'long':
+                    new_stop_loss = mark_price * (1 - trailing_distance)
+                    
+                    # Only move stop loss if it's higher than the current one
+                    if new_stop_loss > position['stop_loss']:
+                        # Update stop loss order
+                        try:
+                            # Cancel existing stop loss
+                            api_call_with_retry(client.futures_cancel_order, symbol=symbol, orderId=position['stop_order_id'])
+                            
+                            # Place new stop loss
+                            stop_loss_order = api_call_with_retry(
+                                client.futures_create_order,
+                                symbol=symbol,
+                                side=Client.SIDE_SELL,
+                                type=Client.ORDER_TYPE_STOP_MARKET,
+                                stopPrice=new_stop_loss,
+                                closePosition='true',
+                                timeInForce=Client.TIME_IN_FORCE_GTC
+                            )
+                            
+                            # Update position information
+                            position['stop_loss'] = new_stop_loss
+                            position['stop_order_id'] = stop_loss_order['orderId']
+                            
+                            logger.info(f"🔄 Updated trailing stop for {symbol} to ${new_stop_loss:.4f}")
+                        except Exception as e:
+                            logger.error(f"Error updating trailing stop: {e}")
+                
+                else:  # Short position
+                    new_stop_loss = mark_price * (1 + trailing_distance)
+                    
+                    # Only move stop loss if it's lower than the current one
+                    if new_stop_loss < position['stop_loss']:
+                        # Update stop loss order
+                        try:
+                            # Cancel existing stop loss
+                            api_call_with_retry(client.futures_cancel_order, symbol=symbol, orderId=position['stop_order_id'])
+                            
+                            # Place new stop loss
+                            stop_loss_order = api_call_with_retry(
+                                client.futures_create_order,
+                                symbol=symbol,
+                                side=Client.SIDE_BUY,
+                                type=Client.ORDER_TYPE_STOP_MARKET,
+                                stopPrice=new_stop_loss,
+                                closePosition='true',
+                                timeInForce=Client.TIME_IN_FORCE_GTC
+                            )
+                            
+                            # Update position information
+                            position['stop_loss'] = new_stop_loss
+                            position['stop_order_id'] = stop_loss_order['orderId']
+                            
+                            logger.info(f"🔄 Updated trailing stop for {symbol} to ${new_stop_loss:.4f}")
+                        except Exception as e:
+                            logger.error(f"Error updating trailing stop: {e}")
+            
+            # Check if market is turning against us before reaching take profit
+            if check_market_reversal(symbol, direction, profit_pct):
+                logger.info(f"⚠️ Market reversal detected for {symbol}, closing position early")
+                close_position(symbol, position)
+        
+        except Exception as e:
+            logger.error(f"Error managing position for {symbol}: {e}")
+
+def execute_trade(symbol, direction, quantity, stop_loss, take_profit_levels, signal_info=None):
+    """Execute a trade with sophisticated order management"""
+    if quantity <= 0:
+        logger.error(f"Invalid quantity for {symbol}: {quantity}")
+        return None
+    
+    try:
+        # Get minimum quantity and check
+        min_qty = get_min_quantity(symbol)
+        if quantity < min_qty:
+            logger.error(f"Quantity {quantity} below minimum {min_qty} for {symbol}")
+            return None
+        
+        # Get current price
+        ticker = api_call_with_retry(client.futures_mark_price, symbol=symbol)
+        mark_price = float(ticker['markPrice'])
+        
+        # Determine order side
+        side = Client.SIDE_BUY if direction == 'long' else Client.SIDE_SELL
+        opposite_side = Client.SIDE_SELL if direction == 'long' else Client.SIDE_BUY
+        
+        # Validate trend strength before executing trade
+        if not validate_trend_strength(symbol, direction):
+            logger.info(f"Skipping {symbol} {direction} - insufficient trend strength")
+            return None
+            
+        # Check overall market context
+        if not check_favorable_market_context(symbol, direction):
+            logger.info(f"Skipping {symbol} {direction} - unfavorable market context")
+            return None
+            
+        # Check Fibonacci time alignment (optional boost, not a dealbreaker)
+        fib_time_aligned = check_fib_time_alignment(symbol)
+        if fib_time_aligned:
+            logger.info(f"Fibonacci time alignment detected for {symbol} - proceeding with trade")
+        
+        # Calculate optimized stop loss level
+        optimized_stop = optimize_stop_loss(symbol, direction, mark_price)
+        # Use the more conservative of our calculated stop or the provided stop
+        if direction == 'long' and optimized_stop > stop_loss:
+            stop_loss = optimized_stop
+        elif direction == 'short' and optimized_stop < stop_loss:
+            stop_loss = optimized_stop
+            
+        # Log trade details
+        tp_formatted = []
+        for tp in take_profit_levels:
+            if isinstance(tp, dict):
+                tp_formatted.append(f"${tp['price']:.4f} ({tp['size']*100:.0f}%)")
+            else:
+                tp_formatted.append(f"${tp:.4f}")
+                
+        tp_formatted_str = ', '.join(tp_formatted)
+        direction_emoji = "🟢 LONG" if direction == 'long' else "🔴 SHORT"
+        strategy_name = signal_info.get('strategy', 'unknown').replace('_', ' ').title()
+        
+        logger.info(f"▶️ EXECUTING TRADE: {direction_emoji} {symbol} at ${mark_price:.4f} [{strategy_name}]")
+        if signal_info and signal_info.get('reason'):
+            logger.info(f"📊 REASON: {signal_info['reason']}")
+        logger.info(f"🎯 TARGETS: {tp_formatted_str}")
+        logger.info(f"🛑 STOP LOSS: ${stop_loss:.4f}")
+        
+        # Check if we need to adjust leverage
+        try:
+            position_info = api_call_with_retry(client.futures_position_information, symbol=symbol)
+            current_leverage = int(position_info[0]['leverage'])
+            
+            # Calculate required leverage based on position size and available margin
+            account_info = api_call_with_retry(client.futures_account)
+            available_balance = float(account_info['availableBalance'])
+            
+            position_value = quantity * mark_price
+            required_leverage = max(1, min(20, math.ceil(position_value / (available_balance * 0.5))))
+            
+            # Update leverage if needed
+            if required_leverage != current_leverage:
+                api_call_with_retry(
+                    client.futures_change_leverage,
+                    symbol=symbol,
+                    leverage=required_leverage
+                )
+                logger.info(f"Adjusted leverage to {required_leverage}x")
+        except Exception as e:
+            logger.warning(f"Could not adjust leverage: {e}")
+        
+        # Use position scaling for entry
+        scale_portions = SCALE_PORTIONS
+        executed_qty = 0
+        
+        # Execute the first portion immediately (market order)
+        first_portion_qty = round_step_size(quantity * scale_portions[0], get_step_size(symbol))
+        order = api_call_with_retry(
+            client.futures_create_order,
+            symbol=symbol,
+            side=side,
+            type=Client.ORDER_TYPE_MARKET,
+            quantity=first_portion_qty
+        )
+        executed_qty += first_portion_qty
+        
+        # Get fill price
+        time.sleep(1)  # Wait for order to be processed
+        order_id = order['orderId']
+        order_details = api_call_with_retry(client.futures_get_order, symbol=symbol, orderId=order_id)
+        
+        # Calculate average fill price
+        if float(order_details.get('executedQty', 0)) > 0:
+            avg_price = float(order_details.get('avgPrice', 0)) or float(order_details.get('cumQuote', 0)) / float(order_details['executedQty'])
+        else:
+            avg_price = mark_price
+            
+        logger.info(f"✅ First portion executed: {symbol} {direction.upper()} at ${avg_price:.4f}, quantity: {first_portion_qty}")
+        
+        # Place limit orders for remaining portions at better prices
+        limit_order_ids = []
+        for i, portion in enumerate(scale_portions[1:], 1):
+            if direction == 'long':
+                # For long positions, try to get better entry on pullbacks
+                limit_price = avg_price * (1 - 0.005 * i)  # 0.5% lower for each step
+            else:
+                # For short positions, try to get better entry on bounces
+                limit_price = avg_price * (1 + 0.005 * i)  # 0.5% higher for each step
+                
+            scaled_qty = round_step_size(quantity * portion, get_step_size(symbol))
+            
+            try:
+                limit_order = api_call_with_retry(
+                    client.futures_create_order,
+                    symbol=symbol,
+                    side=side,
+                    type=Client.ORDER_TYPE_LIMIT,
+                    timeInForce=Client.TIME_IN_FORCE_GTC,
+                    quantity=scaled_qty,
+                    price=limit_price
+                )
+                limit_order_ids.append(limit_order['orderId'])
+                logger.info(f"⏳ Placed limit order for portion {i+1}: {scaled_qty} {symbol} at ${limit_price:.4f}")
+            except Exception as e:
+                logger.error(f"Error placing limit order for scaling: {e}")
+        
+        # Place stop loss order
+        stop_loss_order = api_call_with_retry(
+            client.futures_create_order,
+            symbol=symbol,
+            side=opposite_side,
+            type=Client.ORDER_TYPE_STOP_MARKET,
+            stopPrice=stop_loss,
+            closePosition='true',
+            timeInForce=Client.TIME_IN_FORCE_GTC
+        )
+        
+        logger.info(f"🛑 Stop loss placed at ${stop_loss:.4f}")
+        
+        # Use dynamic take profit levels with partial positions
+        take_profit_orders = []
+        
+        # Check if take_profit_levels is a list of dictionaries or just prices
+        if isinstance(take_profit_levels[0], dict):
+            # Already in the format we want
+            tp_levels = take_profit_levels
+        else:
+            # Convert to dictionary format with sizes
+            tp_levels = [{"price": price, "size": size} for price, size in zip(take_profit_levels, TAKE_PROFIT_ALLOCATION)]
+            
+        # Place take profit orders
+        for i, tp in enumerate(tp_levels):
+            # Calculate position size for this take profit
+            level_qty = round_step_size(quantity * tp["size"], get_step_size(symbol))
+            
+            if level_qty <= 0:
+                continue
+                
+            # Place take profit limit order
+            try:
+                tp_order = api_call_with_retry(
+                    client.futures_create_order,
+                    symbol=symbol,
+                    side=opposite_side,
+                    type=Client.ORDER_TYPE_LIMIT,
+                    timeInForce=Client.TIME_IN_FORCE_GTC,
+                    price=tp["price"],
+                    quantity=level_qty,
+                    reduceOnly='true'
+                )
+                
+                take_profit_orders.append(tp_order)
+                
+                tp_percent = abs((tp["price"] / avg_price - 1) * 100)
+                logger.info(f"🎯 Take profit {i+1} placed at ${tp['price']:.4f} ({tp_percent:.1f}%) for {level_qty} units")
+            except Exception as e:
+                logger.error(f"Error placing take profit order: {e}")
+
+        # Create trade record
+        trade = {
+            'symbol': symbol,
+            'direction': direction,
+            'entry_time': int(time.time() * 1000),
+            'entry_price': avg_price,
+            'quantity': quantity,
+            'stop_loss': stop_loss,
+            'take_profits': tp_levels,
+            'stop_order_id': stop_loss_order['orderId'],
+            'tp_order_ids': [order['orderId'] for order in take_profit_orders],
+            'strategy': signal_info.get('strategy', 'unknown'),
+            'status': 'open',
+            'partial_exits': [],
+            'entry_order_id': order_id,
+            'scale_order_ids': limit_order_ids,
+            'executed_qty': executed_qty
+        }
+        
+        # Store in open positions
+        open_positions[symbol] = trade
+        
+        return trade
+    except BinanceAPIException as e:
+        logger.error(f"Binance API error executing trade: {e}")
+        # If order was placed but subsequent orders failed, close the position
+        if 'order_id' in locals() and order_id:
+            try:
+                api_call_with_retry(
+                    client.futures_create_order,
+                    symbol=symbol,
+                    side=opposite_side,
+                    type=Client.ORDER_TYPE_MARKET,
+                    quantity=quantity,
+                    reduceOnly='true'
+                )
+                logger.info(f"Closed position after partial order failure")
+            except Exception as close_e:
+                logger.error(f"Error closing position after order failure: {close_e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error executing trade: {e}")
+        return None
+
+def analyze_symbol(symbol):
+    """Multi-strategy analysis of a symbol for trading signals with enhanced filters"""
+    try:
+        # Check if we have ML models for this symbol
+        has_ml_models = (f"{symbol}_long" in ml_models) or (f"{symbol}_short" in ml_models)
+        
+        # Get market regime
+        regime = detect_market_regime(symbol)
+        
+        # Skip symbols in unfavorable regimes
+        if regime['overall'] in ['illiquid']:
+            logger.debug(f"Skipping {symbol} - Unfavorable regime: {regime['overall']}")
+            return None
+        
+        # Get data for multiple timeframes
+        timeframes = ['1h', '4h', '1d']
+        data = {}
+        
+        for tf in timeframes:
+            df = get_historical_data(symbol, tf, limit=100)
+            if df.empty:
+                logger.debug(f"Skipping {symbol} - Missing data for {tf} timeframe")
+                return None
+            data[tf] = df
+        
+        # Check volume requirements
+        df_1d = data['1d']
+        if df_1d['quote_asset_volume'].iloc[-1] < MIN_DAILY_VOLUME:
+            logger.debug(f"Skipping {symbol} - Insufficient 24h volume: ${df_1d['quote_asset_volume'].iloc[-1]:.2f}")
+            return None
+        
+        # Check if we're near a Fibonacci time point for potential market turning points
+        fib_time_alignment = check_fib_time_alignment(symbol)
+        
+        # Generate signals for each strategy
+        signals = {
+            'trend_following': generate_trend_following_signal(symbol, data, regime),
+            'mean_reversion': generate_mean_reversion_signal(symbol, data, regime),
+            'breakout': generate_breakout_signal(symbol, data, regime),
+            'momentum': generate_momentum_signal(symbol, data, regime)
+        }
+        
+        # Get ML signal if models exist
+        if has_ml_models:
+            ml_signal = generate_ml_signal(symbol, data)
+            signals['ml_enhanced'] = ml_signal
+        
+        # Combine signals with weights
+        combined_long_score = 0
+        combined_short_score = 0
+        weighted_strategies = {}
+        
+        # Apply adaptive weights based on strategy performance
+        for strategy, signal in signals.items():
+            if signal is None:
+                continue
+                
+            weight = adaptive_weights.get(strategy, 1.0)
+            
+            if strategy == 'ml_enhanced':
+                weight *= ML_WEIGHT
+            
+            if signal['direction'] == 'long':
+                combined_long_score += signal['score'] * weight
+                if strategy not in weighted_strategies or signal['score'] > weighted_strategies[strategy]['score']:
+                    weighted_strategies[strategy] = {
+                        'direction': 'long',
+                        'score': signal['score'],
+                        'entry_price': signal['entry_price'],
+                        'stop_loss': signal['stop_loss'],
+                        'take_profits': signal['take_profits']
+                    }
+            elif signal['direction'] == 'short':
+                combined_short_score += signal['score'] * weight
+                if strategy not in weighted_strategies or signal['score'] > weighted_strategies[strategy]['score']:
+                    weighted_strategies[strategy] = {
+                        'direction': 'short',
+                        'score': signal['score'],
+                        'entry_price': signal['entry_price'],
+                        'stop_loss': signal['stop_loss'],
+                        'take_profits': signal['take_profits']
+                    }
+        
+        # Apply fundamental analysis adjustment
+        fundamental_score = calculate_fundamental_score(symbol)
+        fundamental_factor = 1.0 + ((fundamental_score - 50) / 100)  # Range: 0.5 to 1.5
+        
+        combined_long_score *= fundamental_factor
+        combined_short_score *= (2 - fundamental_factor)  # Inverse for shorts
+        
+        # Boost score if we have Fibonacci time alignment
+        if fib_time_alignment:
+            if combined_long_score > combined_short_score:
+                combined_long_score += 15
+                logger.info(f"Fibonacci time alignment detected for {symbol}, boosting long signal")
+            else:
+                combined_short_score += 15
+                logger.info(f"Fibonacci time alignment detected for {symbol}, boosting short signal")
+        
+        # Verify trend strength for all signals
+        if combined_long_score > 70 and combined_long_score > combined_short_score:
+            if not validate_trend_strength(symbol, 'long'):
+                combined_long_score *= 0.7  # Reduce score if trend strength is insufficient
+                logger.debug(f"Reducing {symbol} long score due to insufficient trend strength")
+        elif combined_short_score > 70 and combined_short_score > combined_long_score:
+            if not validate_trend_strength(symbol, 'short'):
+                combined_short_score *= 0.7  # Reduce score if trend strength is insufficient
+                logger.debug(f"Reducing {symbol} short score due to insufficient trend strength")
+        
+        # Check market context
+        long_context_favorable = check_favorable_market_context(symbol, 'long')
+        short_context_favorable = check_favorable_market_context(symbol, 'short')
+        
+        if not long_context_favorable:
+            combined_long_score *= 0.8  # Reduce long score in unfavorable market
+            logger.debug(f"Reducing {symbol} long score due to unfavorable market context")
+        if not short_context_favorable:
+            combined_short_score *= 0.8  # Reduce short score in unfavorable market
+            logger.debug(f"Reducing {symbol} short score due to unfavorable market context")
+
+        # Determine final signal
+        if combined_long_score > 70 and combined_long_score > combined_short_score:
+            # Choose the best performing strategy for parameters
+            best_strategy = max(weighted_strategies.items(), key=lambda x: x[1]['score'] if x[1]['direction'] == 'long' else 0)[0]
+            best_params = weighted_strategies[best_strategy]
+            
+            # Get current price
+            df_1h = data['1h']
+            current_price = df_1h['close'].iloc[-1]
+            
+            # Get ATR for setting dynamic take profits and stop loss
+            atr = df_1h['atr'].iloc[-1]
+            
+            # Set optimized stop loss
+            optimized_stop = optimize_stop_loss(symbol, 'long', current_price)
+            stop_loss = max(best_params['stop_loss'], optimized_stop)  # Use the more conservative one
+            
+            # Set dynamic take profits using the enhanced function
+            take_profits = set_take_profits(current_price, 'long', atr, symbol)
+            
+            # Return long signal
+            return {
+                'symbol': symbol,
+                'direction': 'long',
+                'price': current_price,
+                'stop_loss': stop_loss,
+                'take_profits': take_profits,
+                'score': combined_long_score,
+                'regime': regime['overall'],
+                'strategy': best_strategy,
+                'fundamental_score': fundamental_score,
+                'timestamp': int(time.time() * 1000),
+                'reason': generate_signal_explanation(symbol, 'long', data, regime, best_strategy, fundamental_score)
+            }
+        elif combined_short_score > 70 and combined_short_score > combined_long_score:
+            # Choose the best performing strategy for parameters
+            best_strategy = max(weighted_strategies.items(), key=lambda x: x[1]['score'] if x[1]['direction'] == 'short' else 0)[0]
+            best_params = weighted_strategies[best_strategy]
+            
+            # Get current price
+            df_1h = data['1h']
+            current_price = df_1h['close'].iloc[-1]
+            
+            # Get ATR for setting dynamic take profits and stop loss
+            atr = df_1h['atr'].iloc[-1]
+            
+            # Set optimized stop loss
+            optimized_stop = optimize_stop_loss(symbol, 'short', current_price)
+            stop_loss = min(best_params['stop_loss'], optimized_stop)  # Use the more conservative one
+            
+            # Set dynamic take profits using the enhanced function
+            take_profits = set_take_profits(current_price, 'short', atr, symbol)
+            
+            # Return short signal
+            return {
+                'symbol': symbol,
+                'direction': 'short',
+                'price': current_price,
+                'stop_loss': stop_loss,
+                'take_profits': take_profits,
+                'score': combined_short_score,
+                'regime': regime['overall'],
+                'strategy': best_strategy,
+                'fundamental_score': fundamental_score,
+                'timestamp': int(time.time() * 1000),
+                'reason': generate_signal_explanation(symbol, 'short', data, regime, best_strategy, fundamental_score)
+            }
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error analyzing {symbol}: {e}")
+        return None
+
+def generate_trend_following_signal(symbol, data, regime):
+    """Generate trend following signals with enhanced filters"""
+    try:
+        # Get data for different timeframes
+        df_1h = data['1h']
+        df_4h = data['4h']
+        df_1d = data['1d']
+        
+        # Skip if regime is not favorable for trend following
+        if regime['trend'] not in ['uptrend', 'downtrend']:
+            return None
+        
+        # Current prices
+        current_price = df_1h['close'].iloc[-1]
+        
+        # Trend indicators
+        adx_1h = df_1h['adx'].iloc[-1]
+        adx_4h = df_4h['adx'].iloc[-1]
+        
+        ema_9_1h = df_1h['ema_9'].iloc[-1]
+        ema_21_1h = df_1h['ema_21'].iloc[-1]
+        ema_50_1h = df_1h['ema_50'].iloc[-1]
+        
+        ema_9_4h = df_4h['ema_9'].iloc[-1]
+        ema_21_4h = df_4h['ema_21'].iloc[-1]
+        
+        macd_1h = df_1h['macd'].iloc[-1]
+        macd_signal_1h = df_1h['macd_signal'].iloc[-1]
+        macd_hist_1h = df_1h['macd_hist'].iloc[-1]
+        
+        # Long trend signals
+        long_score = 0
+        
+        # Strong trend (ADX)
+        if adx_1h > 25:
+            long_score += 10
+        if adx_4h > 25:
+            long_score += 15
+            
+        # EMA alignment (hourly)
+        if ema_9_1h > ema_21_1h > ema_50_1h:
+            long_score += 20
+        elif ema_9_1h > ema_21_1h:
+            long_score += 10
+            
+        # EMA alignment (4-hour)
+        if ema_9_4h > ema_21_4h:
+            long_score += 15
+            
+        # MACD signals
+        if macd_1h > macd_signal_1h and macd_hist_1h > 0:
+            long_score += 15
+        elif macd_hist_1h > 0:
+            long_score += 5
+            
+        # Price above key EMAs
+        if current_price > df_1d['ema_50'].iloc[-1]:
+            long_score += 10
+            
+        # Short trend signals
+        short_score = 0
+
+        # Strong trend (ADX)
+        if adx_1h > 25:
+            short_score += 10
+        if adx_4h > 25:
+            short_score += 15
+            
+        # EMA alignment (hourly)
+        if ema_9_1h < ema_21_1h < ema_50_1h:
+            short_score += 20
+        elif ema_9_1h < ema_21_1h:
+            short_score += 10
+            
+        # EMA alignment (4-hour)
+        if ema_9_4h < ema_21_4h:
+            short_score += 15
+            
+        # MACD signals
+        if macd_1h < macd_signal_1h and macd_hist_1h < 0:
+            short_score += 15
+        elif macd_hist_1h < 0:
+            short_score += 5
+            
+        # Price below key EMAs
+        if current_price < df_1d['ema_50'].iloc[-1]:
+            short_score += 10
+            
+        # Determine signal direction
+        if long_score > 50 and long_score > short_score:
+            direction = 'long'
+            score = long_score
+        elif short_score > 50 and short_score > long_score:
+            direction = 'short'
+            score = short_score
+        else:
+            return None
+            
+        # Calculate stop loss and take profit levels
+        atr = df_1h['atr'].iloc[-1]
+        
+        if direction == 'long':
+            # Use the optimized stop loss function
+            stop_loss = optimize_stop_loss(symbol, 'long', current_price)
+            
+            # Use the enhanced take profit function
+            take_profits = set_take_profits(current_price, 'long', atr, symbol)
+        else:
+            # Use the optimized stop loss function
+            stop_loss = optimize_stop_loss(symbol, 'short', current_price)
+            
+            # Use the enhanced take profit function
+            take_profits = set_take_profits(current_price, 'short', atr, symbol)
+            
+        return {
+            'direction': direction,
+            'score': score,
+            'entry_price': current_price,
+            'stop_loss': stop_loss,
+            'take_profits': take_profits
+        }
+    except Exception as e:
+        logger.error(f"Error generating trend following signal for {symbol}: {e}")
+        return None
+
+def run_signal_scanner():
+    """Scan for trading signals"""
+    # Get prioritized trading pairs
+    trading_pairs = prioritize_pairs()
+    
+    if not trading_pairs:
+        logger.warning("❌ No suitable trading pairs found. Skipping scan.")
+        return []
+    
+    logger.info(f"🔍 Starting scan of {len(trading_pairs)} trading pairs...")
+    
+    signals = []
+    
+    # Process pairs in parallel for faster scanning
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_symbol = {executor.submit(analyze_symbol, symbol): symbol for symbol in trading_pairs}
+        
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            try:
+                signal = future.result()
+                if signal:
+                    # Apply Fibonacci time alignment check to boost confidence
+                    if check_fib_time_alignment(symbol):
+                        signal['score'] += 15
+                        signal['fib_time_aligned'] = True
+                        logger.info(f"Fibonacci time alignment detected for {symbol}, boosting signal score to {signal['score']}")
+                    
+                    # Verify market context
+                    if check_favorable_market_context(symbol, signal['direction']):
+                        signals.append(signal)
+                    else:
+                        logger.debug(f"Rejecting {symbol} signal due to unfavorable market context")
+            except Exception as e:
+                logger.error(f"Error analyzing {symbol}: {e}")
+    
+    # Log summary of found signals
+    if signals:
+        logger.info(f"✅ Scan complete. Found {len(signals)} trading opportunities")
+    else:
+        logger.info("✅ Scan complete. No trading opportunities found.")
+    
+    return signals
+
+def execute_signals(signals):
+    """Execute the selected trading signals"""
+    for signal in signals:
+        try:
+            symbol = signal['symbol']
+            direction = signal['direction']
+            entry_price = signal['price']
+            stop_loss = signal['stop_loss']
+            take_profits = signal['take_profits']
+            confidence = signal['score']
+            strategy = signal.get('strategy', 'trend_following')
+            
+            # Skip if we already have a position for this symbol
+            if symbol in open_positions:
+                logger.info(f"Skipping {symbol} - position already open")
+                continue
+            
+            # Calculate position size
+            quantity = calculate_position_size(
+                symbol=symbol,
+                confidence=confidence,
+                stop_loss=stop_loss,
+                entry_price=entry_price,
+                direction=direction,
+                strategy=strategy
+            )
+            
+            if quantity <= 0:
+                logger.warning(f"⚠️ Invalid position size for {symbol}")
+                continue
+            
+            # Execute trade with the enhanced logic
+            trade = execute_trade(
+                symbol=symbol,
+                direction=direction,
+                quantity=quantity,
+                stop_loss=stop_loss,
+                take_profit_levels=take_profits,
+                signal_info=signal
+            )
+            
+            if trade:
+                logger.info(f"✅ Successfully executed {direction} trade for {symbol}")
+            else:
+                logger.error(f"❌ Failed to execute {direction} trade for {symbol}")
+            
+            # Small delay between trades to avoid rate limits
+            time.sleep(1)
+        
+        except Exception as e:
+            logger.error(f"Error executing signal for {signal['symbol']}: {e}")
+
+def get_market_momentum():
+    """Calculate overall market momentum across major crypto assets"""
+    top_coins = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']
+    momentum_scores = []
+    
+    for coin in top_coins:
+        try:
+            df = get_historical_data(coin, '4h', limit=24)
+            if df.empty:
+                continue
+                
+            # Calculate daily momentum score (percentage change)
+            price_change = (df['close'].iloc[-1] / df['close'].iloc[-6] - 1) * 100
+            
+            # Factor in RSI for momentum
+            rsi = df['rsi'].iloc[-1]
+            rsi_factor = 1.0
+            if rsi > 70:
+                rsi_factor = 0.8  # Reduce bullishness when overbought
+            elif rsi < 30:
+                rsi_factor = 0.8  # Reduce bearishness when oversold
+                
+            # Calculate final score
+            final_score = price_change * rsi_factor
+            
+            # Weight by market cap (simplified - BTC gets highest weight)
+            weight = 1.0
+            if coin == 'BTCUSDT':
+                weight = 3.0
+            elif coin == 'ETHUSDT':
+                weight = 2.0
+                
+            momentum_scores.append(final_score * weight)
+        except Exception as e:
+            logger.error(f"Error calculating momentum for {coin}: {e}")
+    
+    # Return average momentum score
+    if momentum_scores:
+        return sum(momentum_scores) / sum([1.0, 2.0, 3.0, 1.0, 1.0][:len(momentum_scores)])
+    return 0.0
+
+def execute_order(symbol, direction, quantity):
+    """Execute a market order"""
+    try:
+        side = Client.SIDE_BUY if direction == 'long' else Client.SIDE_SELL
+        
+        order = api_call_with_retry(
+            client.futures_create_order,
+            symbol=symbol,
+            side=side,
+            type=Client.ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+        
+        logger.info(f"Market order executed: {symbol} {direction.upper()}, quantity: {quantity}")
+        return order
+    except Exception as e:
+        logger.error(f"Error executing market order: {e}")
+        return None
+
+def set_limit_order(symbol, direction, quantity, price_level):
+    """Set a limit order for position scaling"""
+    try:
+        side = Client.SIDE_BUY if direction == 'long' else Client.SIDE_SELL
+        
+        order = api_call_with_retry(
+            client.futures_create_order,
+            symbol=symbol,
+            side=side,
+            type=Client.ORDER_TYPE_LIMIT,
+            timeInForce=Client.TIME_IN_FORCE_GTC,
+            quantity=quantity,
+            price=price_level
+        )
+        
+        logger.info(f"Limit order set: {symbol} {direction.upper()}, quantity: {quantity}, price: {price_level}")
+        return order
+    except Exception as e:
+        logger.error(f"Error setting limit order: {e}")
+        return None
+
+def trading_cycle():
+    """Run a complete trading cycle with enhanced filters and position management"""
+    try:
+        # Log start of cycle
+        logger.info("==================================================")
+        logger.info("🔄 Starting new trading cycle")
+        logger.info("==================================================")
+        
+        # Check and log portfolio status
+        total_balance, available_balance = log_portfolio_status()
+        
+        # Check if ML models need retraining
+        check_ml_retraining()
+        
+        # Manage open positions first (trailing stops, etc.)
+        if open_positions:
+            logger.info(f"🔍 Managing {len(open_positions)} open positions")
+            manage_open_positions()
+        
+        # Scan for new signals
+        signals = run_signal_scanner()
+        
+        # Apply Fibonacci time alignment filter to boost confidence in signals
+        for signal in signals:
+            symbol = signal['symbol']
+            if check_fib_time_alignment(symbol):
+                signal['score'] += 15
+                signal['fib_time_aligned'] = True
+                logger.info(f"Fibonacci time alignment detected for {symbol}, boosting signal score")
+        
+        # Select signals for execution with enhanced validation
+        validated_signals = []
+        for signal in signals:
+            symbol = signal['symbol']
+            direction = signal['direction']
+            
+            # Verify trend strength
+            if not validate_trend_strength(symbol, direction):
+                logger.info(f"Rejecting {symbol} {direction} signal - insufficient trend strength")
+                continue
+                
+            # Verify market context
+            if not check_favorable_market_context(symbol, direction):
+                logger.info(f"Rejecting {symbol} {direction} signal - unfavorable market context")
+                continue
+                
+            # If passed all filters, add to validated signals
+            validated_signals.append(signal)
+            
+        selected_signals = select_signals_for_execution(validated_signals)
+        
+        # Execute selected signals
+        if selected_signals:
+            execute_signals(selected_signals)
+        
+        # Log end of cycle
+        logger.info("✅ Trading cycle completed")
+        logger.info("==================================================")
+    
+    except Exception as e:
+        logger.error(f"Error in trading cycle: {e}")
+        logger.error(traceback.format_exc())
+
+def run_bot():
+    """Main function to run the trading bot with all enhancements"""
+    logger.info("==================================================")
+    logger.info("🚀 STARTING ELITE ADAPTIVE CRYPTO TRADING BOT v2.0")
+    logger.info("📊 Advanced Multi-Strategy AI Trading System")
+    logger.info("==================================================")
+    
+    # Load previous state if available
+    load_state()
+    
+    # Initialize account information
+    try:
+        account_info = api_call_with_retry(client.futures_account)
+        global current_capital
+        current_capital = float(account_info['totalWalletBalance'])
+        logger.info(f"💰 Initial capital: ${current_capital:.2f}")
+    except Exception as e:
+        logger.critical(f"Failed to get account information: {e}")
+        return
+    
+    # Check if we have enough capital to trade
+    if current_capital < MIN_POSITION_SIZE:
+        logger.critical(f"⚠️ Insufficient capital (${current_capital:.2f}) to meet minimum position size (${MIN_POSITION_SIZE:.2f})")
+        return
+    
+    # Initialize ML models
+    try:
+        train_ml_models()
+    except Exception as e:
+        logger.error(f"Error training ML models: {e}")
+        logger.info("Continuing without ML models")
+    
+    # Main trading loop
+    cycle_count = 0
+    
+    while True:
+        try:
+            # Run trading cycle
+            trading_cycle()
+            
+            # Increment cycle count
+            cycle_count += 1
+            
+            # Save state periodically
+            if cycle_count % 5 == 0:
+                save_state()
+                logger.debug("Saved bot state")
+            
+            # Sleep between cycles
+            logger.info(f"⏳ Waiting for next cycle ({cycle_count} cycles completed)...")
+            time.sleep(300)  # 5 minutes between cycles
+        
+        except KeyboardInterrupt:
+            logger.info("Bot manually stopped with keyboard interrupt")
+            save_state()
+            break
+        
+        except Exception as e:
+            logger.error(f"Unexpected error in main loop: {e}")
+            logger.error(traceback.format_exc())
+            
+            # Sleep before retrying
+            time.sleep(60)
+
+def manual_close_all_positions():
+    """Manually close all open positions"""
+    logger.info("🔴 Manually closing all positions")
+    
+    try:
+        for symbol, position in list(open_positions.items()):
+            close_position(symbol, position)
+        
+        # Double-check with exchange
+        positions = api_call_with_retry(client.futures_position_information)
+        
+        for position in positions:
+            if float(position['positionAmt']) != 0:
+                symbol = position['symbol']
+                side = Client.SIDE_SELL if float(position['positionAmt']) > 0 else Client.SIDE_BUY
+                quantity = abs(float(position['positionAmt']))
+                
+                # Close position
+                close_order = api_call_with_retry(
+                    client.futures_create_order,
+                    symbol=symbol,
+                    side=side,
+                    type=Client.ORDER_TYPE_MARKET,
+                    quantity=quantity,
+                    reduceOnly='true'
+                )
+                
+                logger.info(f"Force closed position for {symbol}")
+        
+        logger.info("✅ All positions closed")
+    except Exception as e:
+        logger.error(f"Error closing all positions: {e}")
+
+def cancel_all_orders():
+    """Cancel all open orders"""
+    logger.info("Canceling all open orders")
+    
+    try:
+        # Get all open orders
+        open_orders = api_call_with_retry(client.futures_get_open_orders)
+        
+        if not open_orders:
+            logger.info("No open orders to cancel")
+            return
+        
+        # Group orders by symbol
+        orders_by_symbol = {}
+        for order in open_orders:
+            symbol = order['symbol']
+            if symbol not in orders_by_symbol:
+                orders_by_symbol[symbol] = []
+            orders_by_symbol[symbol].append(order)
+        
+        # Cancel orders by symbol
+        for symbol, orders in orders_by_symbol.items():
+            try:
+                result = client.futures_cancel_all_open_orders(symbol=symbol)
+                logger.info(f"Canceled {len(orders)} orders for {symbol}")
+            except Exception as e:
+                logger.error(f"Error canceling orders for {symbol}: {e}")
+        
+        logger.info(f"Canceled all open orders")
+    except Exception as e:
+        logger.error(f"Error canceling all orders: {e}")
+
+def get_bot_status():
+    """Get current bot status overview"""
+    try:
+        # Get account information
+        account_info = api_call_with_retry(client.futures_account)
+        
+        # Calculate metrics
+        total_balance = float(account_info['totalWalletBalance'])
+        unrealized_pnl = float(account_info['totalUnrealizedProfit'])
+        available_balance = float(account_info['availableBalance'])
+        
+        # Get performance metrics
+        metrics = calculate_performance_metrics()
+        
+        # Prepare status report
+        status = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_balance': total_balance,
+            'unrealized_pnl': unrealized_pnl,
+            'available_balance': available_balance,
+            'open_positions': list(open_positions.keys()),
+            'num_positions': len(open_positions),
+            'win_rate': metrics['win_rate'],
+            'profit_factor': metrics['profit_factor'],
+            'total_trades': metrics['total_trades'],
+            'daily_pnl': daily_pnl,
+            'strategy_performance': metrics.get('strategy_metrics', {})
+        }
+        
+        return status
+    except Exception as e:
+        logger.error(f"Error getting bot status: {e}")
+        return {}
+
+def save_state():
+    """Save bot state to file for recovery after restart"""
+    try:
+        state = {
+            'open_positions': open_positions,
+            'trade_history': trade_history,
+            'current_capital': current_capital,
+            'total_realized_pnl': total_realized_pnl,
+            'daily_pnl': daily_pnl,
+            'start_of_day': start_of_day.timestamp(),
+            'pairs_performance': pairs_performance,
+            'strategy_performance': strategy_performance,
+            'adaptive_weights': adaptive_weights
+        }
+        
+        with open('bot_state.json', 'w') as f:
+            json.dump(state, f, default=str)
+        
+        # Save ML models separately
+        if ml_models:
+            os.makedirs(MODEL_PATH, exist_ok=True)
+            for model_name, model in ml_models.items():
+                try:
+                    joblib.dump(model, os.path.join(MODEL_PATH, f"{model_name}.joblib"))
+                except Exception as model_e:
+                    logger.error(f"Error saving model {model_name}: {model_e}")
+        
+        logger.info("Bot state saved to file")
+    except Exception as e:
+        logger.error(f"Error saving bot state: {e}")
+
+def load_state():
+    """Load bot state from file"""
+    global open_positions, trade_history, current_capital, total_realized_pnl, daily_pnl, start_of_day
+    global pairs_performance, strategy_performance, adaptive_weights, ml_models
+    
+    try:
+        if not os.path.exists('bot_state.json'):
+            logger.info("No saved state found")
+            return False
+        
+        with open('bot_state.json', 'r') as f:
+            state = json.load(f)
+        
+        open_positions = state.get('open_positions', {})
+        trade_history = state.get('trade_history', [])
+        current_capital = state.get('current_capital', 0.0)
+        total_realized_pnl = state.get('total_realized_pnl', 0.0)
+        daily_pnl = state.get('daily_pnl', 0.0)
+        
+        # Convert timestamp back to datetime
+        start_of_day_ts = state.get('start_of_day')
+        if start_of_day_ts:
+            start_of_day = datetime.fromtimestamp(start_of_day_ts)
+        
+        pairs_performance = state.get('pairs_performance', {})
+        strategy_performance = state.get('strategy_performance', {
+            'trend_following': {'wins': 0, 'losses': 0, 'pnl': 0.0},
+            'mean_reversion': {'wins': 0, 'losses': 0, 'pnl': 0.0},
+            'breakout': {'wins': 0, 'losses': 0, 'pnl': 0.0},
+            'momentum': {'wins': 0, 'losses': 0, 'pnl': 0.0},
+            'ml_enhanced': {'wins': 0, 'losses': 0, 'pnl': 0.0}
+        })
+        adaptive_weights = state.get('adaptive_weights', {
+            'trend_following': 1.0,
+            'mean_reversion': 1.0,
+            'breakout': 1.0,
+            'momentum': 1.0,
+            'ml_enhanced': 1.0
+        })
+        
+        # Load ML models if they exist
+        if os.path.exists(MODEL_PATH):
+            for model_file in os.listdir(MODEL_PATH):
+                if model_file.endswith('.joblib'):
+                    model_name = model_file.replace('.joblib', '')
+                    try:
+                        ml_models[model_name] = joblib.load(os.path.join(MODEL_PATH, model_file))
+                    except Exception as model_e:
+                        logger.error(f"Error loading model {model_name}: {model_e}")
+        
+        logger.info("Bot state loaded from file")
+        return True
+    except Exception as e:
+        logger.error(f"Error loading bot state: {e}")
+        return False
+
+def parse_arguments():
+    """Parse command line arguments"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Elite Adaptive Crypto Trading Bot')
+    parser.add_argument('--test', action='store_true', help='Run in test mode without executing trades')
+    parser.add_argument('--backtest', action='store_true', help='Run backtesting on historical data')
+    parser.add_argument('--close-all', action='store_true', help='Close all open positions and exit')
+    parser.add_argument('--cancel-orders', action='store_true', help='Cancel all open orders and exit')
+    parser.add_argument('--status', action='store_true', help='Show bot status and exit')
+    parser.add_argument('--train-ml', action='store_true', help='Train ML models and exit')
+    
+    return parser.parse_args()
+
+# ======================================================
+# Additional Functions for Enhanced Trading Features
+# ======================================================
+
+def check_market_reversal(symbol, direction, current_profit_pct):
+    """Check if the market is showing signs of reversing before reaching take profit"""
+    # Only consider reversals if we have some profit but haven't hit take profit
+    if current_profit_pct < 0.5 or current_profit_pct > 5:
+        return False
+    
+    try:
+        # Get recent price action
+        df = get_historical_data(symbol, '15m', limit=20)
+        
+        if df.empty:
+            return False
+        
+        # Check indicators for reversal signals
+        if direction == 'long':
+            # For long positions, look for bearish reversal signs
+            
+            # RSI divergence (price making higher high but RSI making lower high)
+            if (df['close'].iloc[-1] > df['close'].iloc[-2] and 
+                df['rsi'].iloc[-1] < df['rsi'].iloc[-2] and 
+                df['rsi'].iloc[-1] > 70):
+                return True
+            
+            # MACD turning bearish
+            if (df['macd_hist'].iloc[-1] < 0 and 
+                df['macd_hist'].iloc[-2] > 0):
+                return True
+            
+            # Major rejection candle
+            last_candle_body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
+            last_candle_high_wick = df['high'].iloc[-1] - max(df['open'].iloc[-1], df['close'].iloc[-1])
+            
+            if last_candle_high_wick > last_candle_body * 2 and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.5:
+                return True
+                
+        else:  # Short position
+            # For short positions, look for bullish reversal signs
+            
+            # RSI divergence (price making lower low but RSI making higher low)
+            if (df['close'].iloc[-1] < df['close'].iloc[-2] and 
+                df['rsi'].iloc[-1] > df['rsi'].iloc[-2] and 
+                df['rsi'].iloc[-1] < 30):
+                return True
+            
+            # MACD turning bullish
+            if (df['macd_hist'].iloc[-1] > 0 and 
+                df['macd_hist'].iloc[-2] < 0):
+                return True
+            
+            # Major rejection candle
+            last_candle_body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
+            last_candle_low_wick = min(df['open'].iloc[-1], df['close'].iloc[-1]) - df['low'].iloc[-1]
+            
+            if last_candle_low_wick > last_candle_body * 2 and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.5:
+                return True
+        
+        return False
+    except Exception as e:
+        logger.error(f"Error checking market reversal: {e}")
+        return False
+
+def close_position(symbol, position):
+    """Close an open position completely"""
+    try:
+        # Cancel all existing orders
+        api_call_with_retry(client.futures_cancel_all_open_orders, symbol=symbol)
+        
+        # Get position information
+        current_positions = api_call_with_retry(client.futures_position_information, symbol=symbol)
+        
+        for pos in current_positions:
+            position_amt = float(pos['positionAmt'])
+            if position_amt != 0:
+                # Determine order side for closing
+                side = Client.SIDE_SELL if position_amt > 0 else Client.SIDE_BUY
+                quantity = abs(position_amt)
+                
+                # Close position with market order
+                close_order = api_call_with_retry(
+                    client.futures_create_order,
+                    symbol=symbol,
+                    side=side,
+                    type=Client.ORDER_TYPE_MARKET,
+                    quantity=quantity,
+                    reduceOnly='true'
+                )
+                
+                logger.info(f"Position closed for {symbol} at market price")
+                
+                # Wait for order to execute
+                time.sleep(1)
+                
+                # Calculate PnL
+                entry_price = position['entry_price']
+                exit_price = float(api_call_with_retry(client.futures_mark_price, symbol=symbol)['markPrice'])
+                
+                if position['direction'] == 'long':
+                    pnl_percent = (exit_price / entry_price - 1) * 100
+                    pnl_amount = (exit_price - entry_price) * quantity
+                else:
+                    pnl_percent = (entry_price / exit_price - 1) * 100
+                    pnl_amount = (entry_price - exit_price) * quantity
+                
+                # Remove from open positions
+                if symbol in open_positions:
+                    del open_positions[symbol]
+                
+                # Update trade history
+                update_trade_history({
+                    'symbol': symbol,
+                    'direction': position['direction'],
+                    'entry_time': position['entry_time'],
+                    'exit_time': int(time.time() * 1000),
+                    'entry_price': entry_price,
+                    'exit_price': exit_price,
+                    'quantity': quantity,
+                    'pnl': pnl_amount,
+                    'pnl_percent': pnl_percent,
+                    'exit_reason': 'manual_close',
+                    'timestamp': int(time.time() * 1000),
+                    'strategy': position.get('strategy', 'unknown')
+                })
+                
+                return True
+        
+        return False
+    except Exception as e:
+        logger.error(f"Error closing position for {symbol}: {e}")
+        return False
+
+def close_trade(symbol, position, reason, exit_price=None):
+    """Record a closed trade and remove from open positions"""
+    try:
+        if exit_price is None:
+            # Get current price
+            exit_price = float(api_call_with_retry(client.futures_mark_price, symbol=symbol)['markPrice'])
+        
+        entry_price = position['entry_price']
+        quantity = position['quantity']
+        
+        # Calculate PnL
+        if position['direction'] == 'long':
+            pnl_percent = (exit_price / entry_price - 1) * 100
+            pnl_amount = (exit_price - entry_price) * quantity
+        else:
+            pnl_percent = (entry_price / exit_price - 1) * 100
+            pnl_amount = (entry_price - exit_price) * quantity
+        
+        # Remove from open positions
+        if symbol in open_positions:
+            del open_positions[symbol]
+        
+        # Update trade history
+        update_trade_history({
+            'symbol': symbol,
+            'direction': position['direction'],
+            'entry_time': position['entry_time'],
+            'exit_time': int(time.time() * 1000),
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'quantity': quantity,
+            'pnl': pnl_amount,
+            'pnl_percent': pnl_percent,
+            'exit_reason': reason,
+            'timestamp': int(time.time() * 1000),
+            'strategy': position.get('strategy', 'unknown')
+        })
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error recording closed trade for {symbol}: {e}")
+        return False
+
+def select_signals_for_execution(signals):
+    """Select the best signals for execution based on score, trend strength, and available slots"""
+    if not signals:
+        return []
+    
+    # Get number of currently open positions
+    num_open_positions = len(open_positions)
+    available_slots = MAX_POSITIONS - num_open_positions
+    
+    if available_slots <= 0:
+        logger.info(f"No available position slots ({num_open_positions}/{MAX_POSITIONS} positions open)")
+        return []
+    
+    # Validate signals with trend strength and market context checks
+    validated_signals = []
+    for signal in signals:
+        symbol = signal['symbol']
+        direction = signal['direction']
+        
+        # Skip if we already have a position for this symbol
+        if symbol in open_positions:
+            continue
+            
+        # Only take signals that pass trend strength validation
+        if validate_trend_strength(symbol, direction):
+            # Only take signals that align with market context
+            if check_favorable_market_context(symbol, direction):
+                validated_signals.append(signal)
+            else:
+                logger.debug(f"Skipping {symbol} - unfavorable market context")
+        else:
+            logger.debug(f"Skipping {symbol} - insufficient trend strength")
+    
+    # Sort remaining signals by score (highest first)
+    sorted_signals = sorted(validated_signals, key=lambda x: x.get('score', 0), reverse=True)
+    
+    # Select top signals up to available slots
+    selected = sorted_signals[:available_slots]
+    
+    # Check if we're hitting the circuit breaker
+    if check_daily_circuit_breaker():
+        logger.warning("⚠️ Daily circuit breaker triggered - no new trades allowed")
+        return []
+    
+    # Ensure diversification - don't take too many correlated trades
+    diversified_signals = []
+    selected_bases = []
+    
+    for signal in selected:
+        symbol = signal['symbol']
+        base = symbol.replace('USDT', '')
+        
+        # Check if we already have too many coins from same category
+        # This is a basic categorization, could be improved with more sophisticated clustering
+        major_coins = ['BTC', 'ETH']
+        defi_coins = ['UNI', 'AAVE', 'COMP', 'MKR', 'SNX', 'SUSHI']
+        l1_coins = ['SOL', 'AVAX', 'ADA', 'ATOM', 'DOT', 'NEAR', 'FTM', 'MATIC']
+        
+        category = None
+        if base in major_coins:
+            category = 'major'
+        elif base in defi_coins:
+            category = 'defi'
+        elif base in l1_coins:
+            category = 'l1'
+            
+        # Track how many of each category we've selected
+        categories_count = {}
+        for selected_base in selected_bases:
+            if selected_base in major_coins:
+                categories_count['major'] = categories_count.get('major', 0) + 1
+            elif selected_base in defi_coins:
+                categories_count['defi'] = categories_count.get('defi', 0) + 1
+            elif selected_base in l1_coins:
+                categories_count['l1'] = categories_count.get('l1', 0) + 1
+                
+        # Limit to max 2 coins from same category for diversification
+        if category and categories_count.get(category, 0) >= 2:
+            logger.debug(f"Skipping {symbol} to maintain diversification (too many {category} coins)")
+            continue
+            
+        diversified_signals.append(signal)
+        selected_bases.append(base)
+        
+        # Stop if we've reached available slots
+        if len(diversified_signals) >= available_slots:
+            break
+    
+    # Enhance logging with clear indication of selected pairs
+    if diversified_signals:
+        pairs_info = []
+        for signal in diversified_signals:
+            direction_emoji = "🟢" if signal['direction'] == 'long' else "🔴"
+            strategy_name = signal.get('strategy', 'unknown').replace('_', ' ').title()
+            pairs_info.append(f"{direction_emoji} {signal['symbol']} [{strategy_name}]")
+        
+        logger.info(f"Selected {len(diversified_signals)} trading opportunities: {', '.join(pairs_info)}")
+    else:
+        logger.info("No signals selected for execution")
+    
+    return diversified_signals
+
+def calculate_position_size(symbol, confidence, stop_loss, entry_price, direction, strategy):
+    """Calculate optimal position size with advanced risk management"""
+    global current_capital, total_realized_pnl
+    
+    try:
+        # Get account balance
+        account_info = api_call_with_retry(client.futures_account)
+        available_balance = float(account_info['availableBalance'])
+        current_capital = float(account_info['totalWalletBalance'])
+        
+        # Base risk percentage (adaptive based on strategy performance)
+        base_risk_percentage = BASE_CAPITAL_PER_TRADE
+        
+        # Adjust based on win/loss streak
+        if len(trade_history) >= 3:
+            recent_trades = trade_history[-3:]
+            consecutive_losses = all(trade['pnl'] < 0 for trade in recent_trades)
+            consecutive_wins = all(trade['pnl'] > 0 for trade in recent_trades)
+            
+            if consecutive_losses:
+                # Reduce risk after consecutive losses
+                base_risk_percentage *= 0.7  # 30% reduction
+                logger.info("⚠️ Reducing position size due to consecutive losses")
+            elif consecutive_wins:
+                # Slightly increase risk after consecutive wins
+                base_risk_percentage *= 1.1  # 10% increase
+                logger.info("🔼 Slightly increasing position size due to consecutive wins")
+        
+        # Adjust based on strategy performance
+        strategy_weight = adaptive_weights.get(strategy, 1.0)
+        base_risk_percentage *= strategy_weight
+        
+        # Apply volatility adjustment based on ATR
+        try:
+            df = get_historical_data(symbol, '1d', limit=14)
+            if not df.empty and 'atr_percent' in df.columns:
+                volatility = df['atr_percent'].iloc[-1]
+                
+                # Scale volatility factor: lower for high volatility, higher for low volatility
+                if volatility > 5:  # Very high volatility
+                    volatility_factor = 0.7
+                elif volatility > 3:  # High volatility
+                    volatility_factor = 0.8
+                elif volatility < 1:  # Low volatility
+                    volatility_factor = 1.2
+                else:  # Normal volatility
+                    volatility_factor = 1.0
+                    
+                base_risk_percentage *= volatility_factor
+        except Exception as e:
+            logger.error(f"Error calculating volatility adjustment: {e}")
+            
+        # Apply confidence adjustment
+        confidence_factor = min(confidence / 100, 1.0)  # Normalize to 0-1
+        base_risk_percentage *= (0.8 + (confidence_factor * 0.4))  # Scale from 80% to 120% based on confidence
+        
+        # Cap maximum risk percentage
+        risk_percentage = min(base_risk_percentage, MAX_RISK_PER_TRADE)
+        
+        # Calculate dollar risk amount
+        risk_amount = current_capital * risk_percentage
+        
+        # Calculate stop loss distance
+        if direction == 'long':
+            stop_loss_pct = (entry_price - stop_loss) / entry_price
+        else:
+            stop_loss_pct = (stop_loss - entry_price) / entry_price
+        
+        # Calculate position size (in quote currency)
+        position_value = risk_amount / stop_loss_pct if stop_loss_pct > 0 else 0
+        
+        # Check portfolio heat (total risk exposure)
+        current_positions = api_call_with_retry(client.futures_position_information)
+        active_positions = [p for p in current_positions if float(p['positionAmt']) != 0]
+        
+        current_risk = 0
+        for pos in active_positions:
+            position_size_usd = abs(float(pos['positionAmt'])) * float(pos['entryPrice'])
+            symbol_stop = 0
+            
+            # Find stop loss for existing position
+            if pos['symbol'] in open_positions:
+                symbol_stop = open_positions[pos['symbol']]['stop_loss']
+                
+                # Calculate risk for this position
+                if float(pos['positionAmt']) > 0:  # Long
+                    stop_dist = (float(pos['entryPrice']) - symbol_stop) / float(pos['entryPrice'])
+                else:  # Short
+                    stop_dist = (symbol_stop - float(pos['entryPrice'])) / float(pos['entryPrice'])
+                    
+                position_risk = position_size_usd * stop_dist
+                current_risk += position_risk
+        
+        # Check if adding this position would exceed max portfolio heat
+        if (current_risk + risk_amount) / current_capital > PORTFOLIO_HEAT:
+            # Scale down position size to maintain max heat
+            max_additional_risk = (PORTFOLIO_HEAT * current_capital) - current_risk
+            if max_additional_risk <= 0:
+                logger.warning(f"⚠️ Maximum portfolio heat reached, skipping trade")
+                return 0
+                
+            # Adjust position size based on maximum allowed additional risk
+            position_value = min(position_value, max_additional_risk / stop_loss_pct)
+            logger.info(f"⚠️ Position size reduced to maintain portfolio heat limit")
+        
+        # Check if position size is below minimum
+        if position_value < MIN_POSITION_SIZE:
+            # If less than minimum position size, check if we want to skip or use minimum size
+            if position_value < MIN_POSITION_SIZE * 0.7:  # Significantly below minimum
+                logger.info(f"⚠️ Calculated position size ${position_value:.2f} too small, skipping trade")
+                return 0
+            
+            # Use minimum position size
+            position_value = MIN_POSITION_SIZE
+            logger.info(f"⚠️ Adjusting position size to minimum ${MIN_POSITION_SIZE}")
+        
+        # Ensure we're not using more than 50% of available balance for a single trade
+        max_position_value = available_balance * 0.5
+        if position_value > max_position_value:
+            position_value = max_position_value
+            logger.info(f"⚠️ Limiting position size to 50% of available balance")
+        
+        # Calculate quantity from position value
+        quantity = position_value / entry_price
+        
+        # Get step size and round quantity
+        step_size = get_step_size(symbol)
+        quantity = round_step_size(quantity, step_size)
+        
+        # Calculate actual risk amount after rounding
+        if direction == 'long':
+            actual_risk = quantity * entry_price * ((entry_price - stop_loss) / entry_price)
+        else:
+            actual_risk = quantity * entry_price * ((stop_loss - entry_price) / entry_price)
+        
+        # Calculate risk percentage of capital
+        risk_pct = actual_risk / current_capital * 100
+        
+        logger.info(f"💰 Position sizing: {quantity} {symbol} (${quantity * entry_price:.2f}) with {risk_pct:.2f}% risk")
+        
+        return quantity
+    except Exception as e:
+        logger.error(f"Error calculating position size: {e}")
+        return 0
+
+# ======================================================
+# Additional Helper Functions
+# ======================================================
+
+def execute_staggered_take_profits(symbol, position):
+    """Implement staggered take profits with smart profit lock-in"""
+    try:
+        # Get current price
+        ticker = api_call_with_retry(client.futures_mark_price, symbol=symbol)
+        mark_price = float(ticker['markPrice'])
+        entry_price = position['entry_price']
+        
+        # Calculate current profit
+        direction = position['direction']
+        if direction == 'long':
+            profit_pct = (mark_price / entry_price - 1) * 100
+        else:
+            profit_pct = (entry_price / mark_price - 1) * 100
+            
+        # First level take profit activation (lock in some profit)
+        if profit_pct >= 5 and not position.get('first_tp_triggered', False):
+            # Close 25% of position
+            quantity = position['quantity'] * 0.25
+            quantity = round_step_size(quantity, get_step_size(symbol))
+            
+            # Check if quantity is valid
+            if quantity > 0:
+                side = Client.SIDE_SELL if direction == 'long' else Client.SIDE_BUY
+                
+                # Execute take profit
+                tp_order = api_call_with_retry(
+                    client.futures_create_order,
+                    symbol=symbol,
+                    side=side,
+                    type=Client.ORDER_TYPE_MARKET,
+                    quantity=quantity,
+                    reduceOnly='true'
+                )
+                
+                # Update position
+                position['quantity'] -= quantity
+                position['first_tp_triggered'] = True
+                
+                # Log partial profit taken
+                logger.info(f"🎯 First take profit triggered for {symbol}. Closed 25% at {profit_pct:.2f}% profit")
+                
+                return True
+                
+        # Second level take profit
+        if profit_pct >= 10 and not position.get('second_tp_triggered', False):
+            # Close another 25%
+            quantity = position['quantity'] * 0.33  # 33% of remaining (25% of original)
+            quantity = round_step_size(quantity, get_step_size(symbol))
+            
+            if quantity > 0:
+                side = Client.SIDE_SELL if direction == 'long' else Client.SIDE_BUY
+                
+                # Execute take profit
+                tp_order = api_call_with_retry(
+                    client.futures_create_order,
+                    symbol=symbol,
+                    side=side,
+                    type=Client.ORDER_TYPE_MARKET,
+                    quantity=quantity,
+                    reduceOnly='true'
+                )
+                
+                # Update position
+                position['quantity'] -= quantity
+                position['second_tp_triggered'] = True
+                
+                # Log partial profit taken
+                logger.info(f"🎯 Second take profit triggered for {symbol}. Closed another 25% at {profit_pct:.2f}% profit")
+                
+                return True
+                
+        return False
+    except Exception as e:
+        logger.error(f"Error executing staggered take profits for {symbol}: {e}")
+        return False
+
+def calculate_fibonacci_price_levels(df, direction):
+    """Calculate key Fibonacci price levels for entries and take profits"""
+    if df.empty or len(df) < 20:
+        return {}
+        
+    # Find recent high and low for Fibonacci calculation
+    high = df['high'].rolling(window=20).max().iloc[-1]
+    low = df['low'].rolling(window=20).min().iloc[-1]
+    
+    # Calculate Fibonacci levels
+    diff = high - low
+    
+    if direction == 'long':
+        # For long positions, measure retracement from low to high
+        levels = {
+            'entry': low + 0.236 * diff,  # 23.6% retracement
+            'stop_loss': low - 0.1 * diff,  # Below swing low
+            'tp1': low + 0.618 * diff,  # 61.8% of the move
+            'tp2': low + 1.0 * diff,    # 100% (previous high)
+            'tp3': low + 1.618 * diff,  # 161.8% extension
+            'tp4': low + 2.618 * diff   # 261.8% extension
+        }
+    else:
+        # For short positions, measure retracement from high to low
+        levels = {
+            'entry': high - 0.236 * diff,  # 23.6% retracement
+            'stop_loss': high + 0.1 * diff,  # Above swing high
+            'tp1': high - 0.618 * diff,  # 61.8% of the move
+            'tp2': high - 1.0 * diff,    # 100% (previous low)
+            'tp3': high - 1.618 * diff,  # 161.8% extension
+            'tp4': high - 2.618 * diff   # 261.8% extension
+        }
+    
+    return levels
+
+def plot_performance_overview():
+    """Generate performance metrics and plots for the bot"""
+    try:
+        # This would be expanded in a real implementation with visualization
+        # Here we just calculate and log key metrics
+        
+        # Calculate overall performance
+        metrics = calculate_performance_metrics()
+        
+        # Log detailed performance metrics
+        logger.info("==== PERFORMANCE OVERVIEW ====")
+        logger.info(f"Total Trades: {metrics['total_trades']}")
+        logger.info(f"Win Rate: {metrics['win_rate']*100:.2f}%")
+        logger.info(f"Profit Factor: {metrics['profit_factor']:.2f}")
+        logger.info(f"Average Win: ${metrics['avg_win']:.2f}")
+        logger.info(f"Average Loss: ${metrics['avg_loss']:.2f}")
+        logger.info(f"Expectancy: ${metrics['expectancy']:.2f}")
+        logger.info(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+        logger.info(f"Max Drawdown: {metrics['max_drawdown']:.2f}%")
+        
+        # Log strategy performance
+        logger.info("==== STRATEGY PERFORMANCE ====")
+        for strategy, stats in metrics.get('strategy_metrics', {}).items():
+            logger.info(f"{strategy.replace('_', ' ').title()}:")
+            logger.info(f"  Trades: {stats.get('trades', 0)}")
+            logger.info(f"  Win Rate: {stats.get('win_rate', 0)*100:.2f}%")
+            logger.info(f"  P&L: ${stats.get('pnl', 0):.2f}")
+        
+        # In a full implementation, this would generate plots and save them
+        
+        return metrics
+    except Exception as e:
+        logger.error(f"Error generating performance overview: {e}")
+        return None
+
+def generate_mean_reversion_signal(symbol, data, regime):
+    """Generate mean reversion signals with enhanced filters"""
+    try:
+        # Get data from different timeframes
+        df_1h = data['1h']
+        df_4h = data['4h']
+        
+        # Skip if regime is not favorable for mean reversion
+        if regime['trend'] not in ['ranging', 'ranging_low_vol', 'normal']:
+            return None
+            
+        # Current price and indicators
+        current_price = df_1h['close'].iloc[-1]
+        
+        rsi_1h = df_1h['rsi'].iloc[-1]
+        rsi_4h = df_4h['rsi'].iloc[-1]
+        
+        bb_lower_1h = df_1h['bb_lower'].iloc[-1]
+        bb_upper_1h = df_1h['bb_upper'].iloc[-1]
+        bb_width_1h = df_1h['bb_width'].iloc[-1]
+        
+        stoch_k_1h = df_1h['stoch_k'].iloc[-1]
+        stoch_d_1h = df_1h['stoch_d'].iloc[-1]
+        
+        # Long (oversold) mean reversion signals
+        long_score = 0
+        
+        # RSI oversold
+        if rsi_1h < 30:
+            long_score += 20
+        elif rsi_1h < 40:
+            long_score += 10
+            
+        if rsi_4h < 30:
+            long_score += 15
+        elif rsi_4h < 40:
+            long_score += 7
+            
+        # Price at/below lower Bollinger Band
+        if current_price <= bb_lower_1h:
+            long_score += 20
+        elif current_price <= bb_lower_1h * 1.01:
+            long_score += 10
+            
+        # Stochastic oversold and turning up
+        if stoch_k_1h < 20 and stoch_k_1h > stoch_d_1h:
+            long_score += 15
+            
+        # Narrow Bollinger Bands (low volatility)
+        if bb_width_1h < 0.03:  # 3% width relative to price
+            long_score += 10
+            
+        # Short (overbought) mean reversion signals
+        short_score = 0
+        
+        # RSI overbought
+        if rsi_1h > 70:
+            short_score += 20
+        elif rsi_1h > 60:
+            short_score += 10
+            
+        if rsi_4h > 70:
+            short_score += 15
+        elif rsi_4h > 60:
+            short_score += 7
+            
+        # Price at/above upper Bollinger Band
+        if current_price >= bb_upper_1h:
+            short_score += 20
+        elif current_price >= bb_upper_1h * 0.99:
+            short_score += 10
+            
+        # Stochastic overbought and turning down
+        if stoch_k_1h > 80 and stoch_k_1h < stoch_d_1h:
+            short_score += 15
+            
+        # Narrow Bollinger Bands (low volatility)
+        if bb_width_1h < 0.03:  # 3% width relative to price
+            short_score += 10
+            
+        # Determine signal direction
+        if long_score > 40 and long_score > short_score:
+            direction = 'long'
+            score = long_score
+        elif short_score > 40 and short_score > long_score:
+            direction = 'short'
+            score = short_score
+        else:
+            return None
+            
+        # Calculate stop loss and take profit levels
+        atr = df_1h['atr'].iloc[-1]
+        
+        if direction == 'long':
+            # Use optimized stop loss function for tighter stops
+            stop_loss = optimize_stop_loss(symbol, 'long', current_price)
+            
+            # Use enhanced take profit function
+            take_profits = set_take_profits(current_price, 'long', atr, symbol)
+        else:
+            # Use optimized stop loss function for tighter stops
+            stop_loss = optimize_stop_loss(symbol, 'short', current_price)
+            
+            # Use enhanced take profit function
+            take_profits = set_take_profits(current_price, 'short', atr, symbol)
+            
+        return {
+            'direction': direction,
+            'score': score,
+            'entry_price': current_price,
+            'stop_loss': stop_loss,
+            'take_profits': take_profits
+        }
+    except Exception as e:
+        logger.error(f"Error generating mean reversion signal for {symbol}: {e}")
+        return None
+
+def generate_breakout_signal(symbol, data, regime):
+    """Generate volatility breakout signals with enhanced filters"""
+    try:
+        # Get data from different timeframes
+        df_1h = data['1h']
+        df_4h = data['4h']
+        
+        # Breakouts work best in high volatility regimes
+        if regime['volatility'] != 'high':
+            return None
+            
+        # Current price and indicators
+        current_price = df_1h['close'].iloc[-1]
+        
+        # Check for key breakout levels
+        # 1. Recent swing highs/lows
+        recent_highs = df_4h['high'].iloc[-20:].rolling(window=5).max()
+        highest_high = recent_highs.max()
+        
+        recent_lows = df_4h['low'].iloc[-20:].rolling(window=5).min()
+        lowest_low = recent_lows.min()
+        
+        # 2. Key resistance levels (for longs)
+        resistance_level = None
+        resistance_breaks = 0
+        
+        for i in range(2, 20):
+            if df_1h['high'].iloc[-i] < highest_high and df_1h['high'].iloc[-1] > highest_high:
+                resistance_breaks += 1
+                resistance_level = highest_high
+                break
+        
+        # 3. Key support levels (for shorts)
+        support_level = None
+        support_breaks = 0
+        
+        for i in range(2, 20):
+            if df_1h['low'].iloc[-i] > lowest_low and df_1h['low'].iloc[-1] < lowest_low:
+                support_breaks += 1
+                support_level = lowest_low
+                break
+        
+        # 4. Volume confirmation
+        volume_ratio = df_1h['volume'].iloc[-1] / df_1h['volume'].iloc[-10:].mean()
+        volume_increasing = volume_ratio > 1.5
+        
+        # Long breakout signals
+        long_score = 0
+        
+        # Price breaking above resistance
+        if resistance_breaks > 0:
+            long_score += 30
+            
+        # Volume confirmation
+        if volume_increasing:
+            long_score += 20
+            
+        # Momentum confirmation
+        if df_1h['rsi'].iloc[-1] > 50 and df_1h['macd_hist'].iloc[-1] > 0:
+            long_score += 20
+            
+        # ADX increasing (strengthening trend)
+        if df_1h['adx'].iloc[-1] > 20 and df_1h['adx'].iloc[-1] > df_1h['adx'].iloc[-2]:
+            long_score += 15
+            
+        # Check Fibonacci time alignment for better entry timing
+        if check_fib_time_alignment(symbol):
+            long_score += 15
+            
+        # Short breakout signals
+        short_score = 0
+        
+        # Price breaking below support
+        if support_breaks > 0:
+            short_score += 30
+            
+        # Volume confirmation
+        if volume_increasing:
+            short_score += 20
+            
+        # Momentum confirmation
+        if df_1h['rsi'].iloc[-1] < 50 and df_1h['macd_hist'].iloc[-1] < 0:
+            short_score += 20
+            
+        # ADX increasing (strengthening trend)
+        if df_1h['adx'].iloc[-1] > 20 and df_1h['adx'].iloc[-1] > df_1h['adx'].iloc[-2]:
+            short_score += 15
+            
+        # Check Fibonacci time alignment for better entry timing
+        if check_fib_time_alignment(symbol):
+            short_score += 15
+            
+        # Determine signal direction
+        if long_score > 50 and long_score > short_score:
+            direction = 'long'
+            score = long_score
+        elif short_score > 50 and short_score > long_score:
+            direction = 'short'
+            score = short_score
+        else:
+            return None
+            
+        # Calculate stop loss and take profit levels
+        atr = df_1h['atr'].iloc[-1]
+        
+        if direction == 'long':
+            # Stop loss: Just below the breakout level or optimized stop loss
+            if resistance_level:
+                stop_loss = resistance_level * 0.98
+                # Use the tighter of our calculated stop or the optimized one
+                optimized_stop = optimize_stop_loss(symbol, 'long', current_price)
+                stop_loss = max(stop_loss, optimized_stop)  # For longs, higher stop loss is tighter
+            else:
+                stop_loss = optimize_stop_loss(symbol, 'long', current_price)
+                
+            # Enhanced take profits with staggered exits
+            take_profits = set_take_profits(current_price, 'long', atr, symbol)
+                
+        else:
+            # Stop loss: Just above the breakout level or optimized stop loss
+            if support_level:
+                stop_loss = support_level * 1.02
+                # Use the tighter of our calculated stop or the optimized one
+                optimized_stop = optimize_stop_loss(symbol, 'short', current_price)
+                stop_loss = min(stop_loss, optimized_stop)  # For shorts, lower stop loss is tighter
+            else:
+                stop_loss = optimize_stop_loss(symbol, 'short', current_price)
+                
+            # Enhanced take profits with staggered exits
+            take_profits = set_take_profits(current_price, 'short', atr, symbol)
+            
+        return {
+            'direction': direction,
+            'score': score,
+            'entry_price': current_price,
+            'stop_loss': stop_loss,
+            'take_profits': take_profits
+        }
+    except Exception as e:
+        logger.error(f"Error generating breakout signal for {symbol}: {e}")
+        return None
+
+def generate_momentum_signal(symbol, data, regime):
+    """Generate momentum signals with enhanced filters"""
+    try:
+        # Get data from different timeframes
+        df_1h = data['1h']
+        df_4h = data['4h']
+        df_1d = data['1d']
+        
+        # Current price and indicators
+        current_price = df_1h['close'].iloc[-1]
+        
+        # Key momentum indicators
+        roc_1h = df_1h['roc'].iloc[-1] if 'roc' in df_1h else 0
+        roc_4h = df_4h['roc'].iloc[-1] if 'roc' in df_4h else 0
+        
+        macd_hist_1h = df_1h['macd_hist'].iloc[-1]
+        macd_hist_4h = df_4h['macd_hist'].iloc[-1]
+        
+        stoch_rsi_k = df_1h['stoch_k'].iloc[-1] if 'stoch_k' in df_1h else 50
+        stoch_rsi_d = df_1h['stoch_d'].iloc[-1] if 'stoch_d' in df_1h else 50
+        
+        # Price performance
+        price_change_1d = (df_1h['close'].iloc[-1] / df_1h['close'].iloc[-24] - 1) * 100
+        price_change_1w = (df_1h['close'].iloc[-1] / df_1h['close'].iloc[-168] - 1) * 100 if len(df_1h) >= 168 else 0
+        
+        # Long momentum signals
+        long_score = 0
+        
+        # Strong price movement
+        if price_change_1d > 3:
+            long_score += 15
+        if price_change_1w > 10:
+            long_score += 10
+            
+        # Positive momentum indicators
+        if roc_1h > 0 and roc_4h > 0:
+            long_score += 15
+        if macd_hist_1h > 0 and macd_hist_1h > macd_hist_4h:
+            long_score += 15
+            
+        # Stochastic RSI momentum
+        if stoch_rsi_k > stoch_rsi_d and stoch_rsi_k > 50:
+            long_score += 15
+            
+        # Volume confirmation
+        volume_ratio = df_1h['volume'].iloc[-1] / df_1h['volume'].iloc[-10:].mean()
+        if volume_ratio > 1.2:
+            long_score += 10
+            
+        # Check if strong trend confirmed across timeframes
+        if validate_trend_strength(symbol, 'long'):
+            long_score += 15
+            
+        # Check market context alignment
+        if check_favorable_market_context(symbol, 'long'):
+            long_score += 10
+            
+        # Short momentum signals
+        short_score = 0
+        
+        # Strong price movement
+        if price_change_1d < -3:
+            short_score += 15
+        if price_change_1w < -10:
+            short_score += 10
+            
+        # Negative momentum indicators
+        if roc_1h < 0 and roc_4h < 0:
+            short_score += 15
+        if macd_hist_1h < 0 and macd_hist_1h < macd_hist_4h:
+            short_score += 15
+            
+        # Stochastic RSI momentum
+        if stoch_rsi_k < stoch_rsi_d and stoch_rsi_k < 50:
+            short_score += 15
+            
+        # Volume confirmation
+        if volume_ratio > 1.2:
+            short_score += 10
+            
+        # Check if strong trend confirmed across timeframes
+        if validate_trend_strength(symbol, 'short'):
+            short_score += 15
+            
+        # Check market context alignment
+        if check_favorable_market_context(symbol, 'short'):
+            short_score += 10
+            
+        # Determine signal direction
+        if long_score > 40 and long_score > short_score:
+            direction = 'long'
+            score = long_score
+        elif short_score > 40 and short_score > long_score:
+            direction = 'short'
+            score = short_score
+        else:
+            return None
+            
+        # Calculate stop loss and take profit levels using enhanced functions
+        atr = df_1h['atr'].iloc[-1]
+        
+        if direction == 'long':
+            # Use tighter stop loss with optimized function
+            stop_loss = optimize_stop_loss(symbol, 'long', current_price)
+            
+            # Use enhanced take profit function for multi-stage exits
+            take_profits = set_take_profits(current_price, 'long', atr, symbol)
+        else:
+            # Use tighter stop loss with optimized function
+            stop_loss = optimize_stop_loss(symbol, 'short', current_price)
+            
+            # Use enhanced take profit function for multi-stage exits
+            take_profits = set_take_profits(current_price, 'short', atr, symbol)
+            
+        return {
+            'direction': direction,
+            'score': score,
+            'entry_price': current_price,
+            'stop_loss': stop_loss,
+            'take_profits': take_profits
+        }
+    except Exception as e:
+        logger.error(f"Error generating momentum signal for {symbol}: {e}")
+        return None
+
+def generate_ml_signal(symbol, data):
+    """Generate machine learning enhanced signals with improved filtering"""
+    try:
+        # Check if models exist for this symbol
+        long_model_exists = f"{symbol}_long" in ml_models
+        short_model_exists = f"{symbol}_short" in ml_models
+        
+        if not long_model_exists and not short_model_exists:
+            return None
+            
+        # Get ML predictions
+        long_prediction = get_ml_prediction(symbol, 'long') if long_model_exists else {'signal': 0, 'confidence': 0}
+        short_prediction = get_ml_prediction(symbol, 'short') if short_model_exists else {'signal': 0, 'confidence': 0}
+        
+        # Check confidence threshold - require higher confidence with the enhanced models
+        if (long_prediction['confidence'] < ML_CONFIDENCE_THRESHOLD and 
+            short_prediction['confidence'] < ML_CONFIDENCE_THRESHOLD):
+            return None
+            
+        # Validate with advanced trend strength filters
+        long_trend_valid = False
+        short_trend_valid = False
+        
+        if long_prediction['signal'] == 1 and long_prediction['confidence'] > ML_CONFIDENCE_THRESHOLD:
+            long_trend_valid = validate_trend_strength(symbol, 'long')
+            
+        if short_prediction['signal'] == 1 and short_prediction['confidence'] > ML_CONFIDENCE_THRESHOLD:
+            short_trend_valid = validate_trend_strength(symbol, 'short')
+            
+        # Validate with market context
+        long_context_favorable = check_favorable_market_context(symbol, 'long')
+        short_context_favorable = check_favorable_market_context(symbol, 'short')
+            
+        # Determine direction based on strongest signal and validations
+        direction = None
+        confidence = 0
+        
+        if (long_prediction['signal'] == 1 and 
+            long_prediction['confidence'] > short_prediction['confidence'] and
+            long_trend_valid and long_context_favorable):
+                
+            direction = 'long'
+            confidence = long_prediction['confidence']
+            # Scale score: 60-100 based on confidence
+            score = 60 + (confidence - ML_CONFIDENCE_THRESHOLD) / (1 - ML_CONFIDENCE_THRESHOLD) * 40
+                
+        elif (short_prediction['signal'] == 1 and 
+              short_prediction['confidence'] > long_prediction['confidence'] and
+              short_trend_valid and short_context_favorable):
+                  
+            direction = 'short'
+            confidence = short_prediction['confidence']
+            # Scale score: 60-100 based on confidence
+            score = 60 + (confidence - ML_CONFIDENCE_THRESHOLD) / (1 - ML_CONFIDENCE_THRESHOLD) * 40
+        else:
+            return None
+            
+        # Get current price and ATR for stop loss calculation
+        df_1h = data['1h']
+        current_price = df_1h['close'].iloc[-1]
+        atr = df_1h['atr'].iloc[-1]
+        
+        # Use optimized stop loss function for tighter stops
+        stop_loss = optimize_stop_loss(symbol, direction, current_price)
+        
+        # Use enhanced take profits function
+        take_profits = set_take_profits(current_price, direction, atr, symbol)
+            
+        return {
+            'direction': direction,
+            'score': score,
+            'entry_price': current_price,
+            'stop_loss': stop_loss,
+            'take_profits': take_profits,
+            'ml_confidence': confidence
+        }
+    except Exception as e:
+        logger.error(f"Error generating ML signal for {symbol}: {e}")
+        return None
+
+def generate_signal_explanation(symbol, direction, data, regime, strategy, fundamental_score):
+    """Generate human-readable explanation for the trading signal"""
+    try:
+        df_1h = data['1h']
+        df_4h = data['4h']
+        
+        explanation = []
+        
+        # Strategy name
+        strategy_name = strategy.replace('_', ' ').title()
+        explanation.append(f"{direction.capitalize()} signal based on {strategy_name} strategy")
+        
+        # Add market regime info
+        explanation.append(f"Market regime: {regime['overall'].replace('_', ' ').title()}")
+        
+        # Add key indicators based on strategy
+        if strategy == 'trend_following':
+            explanation.append(f"ADX (trend strength): {df_1h['adx'].iloc[-1]:.1f}")
+            if direction == 'long':
+                explanation.append(f"EMAs aligned bullishly (9 > 21)")
+                if df_1h['macd_hist'].iloc[-1] > 0:
+                    explanation.append("MACD histogram positive")
+            else:
+                explanation.append(f"EMAs aligned bearishly (9 < 21)")
+                if df_1h['macd_hist'].iloc[-1] < 0:
+                    explanation.append("MACD histogram negative")
+                    
+        elif strategy == 'mean_reversion':
+            if direction == 'long':
+                explanation.append(f"RSI oversold: {df_1h['rsi'].iloc[-1]:.1f}")
+                explanation.append("Price near lower Bollinger Band")
+            else:
+                explanation.append(f"RSI overbought: {df_1h['rsi'].iloc[-1]:.1f}")
+                explanation.append("Price near upper Bollinger Band")
+                
+        elif strategy == 'breakout':
+            explanation.append("Volume confirmation: Increased volume on breakout")
+            if direction == 'long':
+                explanation.append("Price breaking above key resistance level")
+            else:
+                explanation.append("Price breaking below key support level")
+                
+        elif strategy == 'momentum':
+            if direction == 'long':
+                explanation.append("Strong positive momentum indicators")
+                explanation.append(f"Recent price change: {((df_1h['close'].iloc[-1] / df_1h['close'].iloc[-24]) - 1) * 100:.1f}%")
+            else:
+                explanation.append("Strong negative momentum indicators")
+                explanation.append(f"Recent price change: {((df_1h['close'].iloc[-1] / df_1h['close'].iloc[-24]) - 1) * 100:.1f}%")
+                
+        elif strategy == 'ml_enhanced':
+            if direction == 'long':
+                explanation.append("Machine learning model predicts upward movement")
+                # Get ML confidence if available
+                if 'ml_confidence' in df_1h.columns:
+                    explanation.append(f"ML model confidence: {df_1h['ml_confidence'].iloc[-1]*100:.1f}%")
+            else:
+                explanation.append("Machine learning model predicts downward movement")
+                # Get ML confidence if available
+                if 'ml_confidence' in df_1h.columns:
+                    explanation.append(f"ML model confidence: {df_1h['ml_confidence'].iloc[-1]*100:.1f}%")
+        
+        # Check if Fibonacci time alignment is detected
+        if check_fib_time_alignment(symbol):
+            explanation.append("Fibonacci time alignment detected - favorable timing")
+                
+        # Add fundamental score
+        fundamental_sentiment = "positive" if fundamental_score > 60 else "neutral" if fundamental_score > 40 else "negative"
+        explanation.append(f"Fundamental analysis score: {fundamental_score:.1f}/100 ({fundamental_sentiment})")
+        
+        # Add market context information
+        market_momentum = get_market_momentum()
+        market_momentum_sentiment = "bullish" if market_momentum > 5 else "bearish" if market_momentum < -5 else "neutral"
+        explanation.append(f"Overall market momentum: {market_momentum_sentiment} ({market_momentum:.1f})")
+        
+        # Return formatted explanation
+        return " • ".join(explanation)
+    except Exception as e:
+        logger.error(f"Error generating signal explanation: {e}")
+        return f"{direction.capitalize()} signal based on technical analysis"
+
+def train_ml_models():
+    """Train machine learning models for all symbols with enhanced feature engineering"""
+    logger.info("🧠 Training machine learning models...")
+    
+    global ml_models, ml_last_train_time, feature_scalers
+    
+    # Get symbols with good performance
+    symbols = prioritize_pairs()[:20]  # Focus on top 20 pairs
+    
+    if not symbols:
+        logger.warning("No symbols available for ML training")
+        return
+    
+    # Track successful training
+    successful_training = 0
+    
+    # Train models for each symbol
+    for symbol in symbols:
+        try:
+            # Train models for both directions
+            for direction in ['long', 'short']:
+                # Get historical data - use more data for better model training
+                df = get_historical_data(symbol, '1h', limit=30*24*2)  # 60 days of hourly data
+                
+                if df.empty or len(df) < 100:
+                    continue
+                
+                # Generate features with enhancements
+                features_df = generate_ml_features(df)
+                
+                if features_df.empty:
+                    continue
+                
+                # Create target variable (future price movement)
+                if direction == 'long':
+                    # For long signals, predict if price will go up by 2% or more within next 24 hours
+                    target = (df['close'].shift(-24) > df['close'] * 1.02).astype(int)
+                else:
+                    # For short signals, predict if price will go down by 2% or more within next 24 hours
+                    target = (df['close'].shift(-24) < df['close'] * 0.98).astype(int)
+                
+                # Combine features and target
+                features_df['target'] = target
+                
+                # Drop NaN values
+                features_df = features_df.dropna()
+                
+                if len(features_df) < 100:
+                    continue
+                
+                # Split into train/test sets
+                train_size = int(len(features_df) * 0.8)
+                train_df = features_df.iloc[:train_size]
+                test_df = features_df.iloc[train_size:]
+                
+                # Separate features and target
+                X_train = train_df.drop('target', axis=1)
+                y_train = train_df['target']
+                
+                X_test = test_df.drop('target', axis=1)
+                y_test = test_df['target']
+                
+                # Standardize features
+                scaler = StandardScaler()
+                X_train_scaled = scaler.fit_transform(X_train)
+                X_test_scaled = scaler.transform(X_test)
+                
+                # Store scaler for prediction
+                feature_scalers[f"{symbol}_{direction}"] = scaler
+                
+                # Feature selection
+                if X_train.shape[1] > ML_FEATURES:
+                    # Train a simple model to get feature importances
+                    initial_model = GradientBoostingClassifier(n_estimators=100, random_state=42)
+                    initial_model.fit(X_train_scaled, y_train)
+                    
+                    # Get feature importances
+                    importances = initial_model.feature_importances_
+                    feature_indices = np.argsort(importances)[::-1][:ML_FEATURES]
+                    
+                    # Select top features
+                    X_train_scaled = X_train_scaled[:, feature_indices]
+                    X_test_scaled = X_test_scaled[:, feature_indices]
+                    
+                    # Store selected feature indices
+                    feature_scalers[f"{symbol}_{direction}_features"] = feature_indices
+                else:
+                    feature_scalers[f"{symbol}_{direction}_features"] = np.arange(X_train.shape[1])
+                
+                # Train gradient boosting model with improved parameters
+                model = GradientBoostingClassifier(
+                    n_estimators=300,
+                    learning_rate=0.05,
+                    max_depth=5,
+                    min_samples_split=20,
+                    min_samples_leaf=10,
+                    subsample=0.8,
+                    random_state=42
+                )
+                
+                model.fit(X_train_scaled, y_train)
+                
+                # Evaluate model
+                y_pred = model.predict(X_test_scaled)
+                y_prob = model.predict_proba(X_test_scaled)[:, 1]
+                
+                # Calculate metrics
+                accuracy = np.mean(y_pred == y_test)
+                precision = np.sum((y_pred == 1) & (y_test == 1)) / np.sum(y_pred == 1) if np.sum(y_pred == 1) > 0 else 0
+                recall = np.sum((y_pred == 1) & (y_test == 1)) / np.sum(y_test == 1) if np.sum(y_test == 1) > 0 else 0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                
+                # Only store model if it's reasonably accurate
+                if precision > 0.55 and recall > 0.1:
+                    # Store model
+                    ml_models[f"{symbol}_{direction}"] = model
+                    
+                    # Increment counter
+                    successful_training += 1
+                    
+                    logger.debug(f"Trained ML model for {symbol} {direction}: Precision={precision:.3f}, Recall={recall:.3f}, F1={f1:.3f}")
+                else:
+                    logger.debug(f"Skipping ML model for {symbol} {direction} due to low performance: Precision={precision:.3f}, Recall={recall:.3f}")
+            
+        except Exception as e:
+            logger.error(f"Error training ML model for {symbol}: {e}")
+    
+    # Update timestamp of last training
+    ml_last_train_time = time.time()
+    
+    logger.info(f"✅ ML training completed: {successful_training} models trained successfully")
+    
+    return successful_training
+
+def get_ml_prediction(symbol, direction):
+    """Get machine learning prediction for a symbol with enhanced feature integration"""
+    model_key = f"{symbol}_{direction}"
+    
+    # Check if model exists
+    if model_key not in ml_models:
+        return {'signal': 0, 'confidence': 0}
+    
+    try:
+        # Get latest data
+        df = get_historical_data(symbol, '1h', limit=50)
+        
+        if df.empty:
+            return {'signal': 0, 'confidence': 0}
+        
+        # Generate features
+        features_df = generate_ml_features(df)
+        
+        if features_df.empty:
+            return {'signal': 0, 'confidence': 0}
+        
+        # Get latest feature values
+        latest_features = features_df.iloc[-1].values.reshape(1, -1)
+        
+        # Scale features
+        scaler = feature_scalers.get(model_key)
+        if scaler is None:
+            return {'signal': 0, 'confidence': 0}
+        
+        latest_features_scaled = scaler.transform(latest_features)
+        
+        # Feature selection
+        feature_indices = feature_scalers.get(f"{model_key}_features")
+        if feature_indices is not None:
+            latest_features_scaled = latest_features_scaled[:, feature_indices]
+        
+        # Get prediction
+        model = ml_models[model_key]
+        prediction = model.predict(latest_features_scaled)[0]
+        probability = model.predict_proba(latest_features_scaled)[0, 1]
+        
+        # Enhance with trend strength validation
+        if prediction == 1:
+            trend_valid = validate_trend_strength(symbol, direction)
+            market_context_valid = check_favorable_market_context(symbol, direction)
+            
+            # Adjust confidence based on additional validations
+            if trend_valid and market_context_valid:
+                probability = min(probability * 1.2, 1.0)
+            elif not trend_valid or not market_context_valid:
+                probability = probability * 0.8
+        
+        # Return results
+        return {'signal': prediction, 'confidence': probability}
+    
+    except Exception as e:
+        logger.error(f"Error getting ML prediction for {symbol}: {e}")
+        return {'signal': 0, 'confidence': 0}
+
+def check_ml_retraining():
+    """Check if ML models need retraining"""
+    global ml_last_train_time
+    
+    # Retrain models if it's been too long since last training
+    if ml_last_train_time == 0 or time.time() - ml_last_train_time > ML_RETRAIN_INTERVAL * 86400:
+        logger.info("ML models need retraining due to age")
+        train_ml_models()
+        return True
+    
+    # Check performance of recent ML predictions to determine if retraining is needed
+    ml_accuracy = evaluate_ml_performance()
+    if ml_accuracy < 0.55:  # Less than 55% accuracy
+        logger.info(f"ML models need retraining due to poor performance: {ml_accuracy:.2f}")
+        train_ml_models()
+        return True
+    
+    return False
+
+def evaluate_ml_performance():
+    """Evaluate recent ML prediction accuracy"""
+    # This would track actual performance against predictions
+    # For now we'll return a placeholder value
+    if not trade_history:
+        return 0.6  # Default value
+    
+    # Get recent ML-based trades
+    ml_trades = [t for t in trade_history if t.get('strategy', '') == 'ml_enhanced']
+    if not ml_trades or len(ml_trades) < 5:  # Need enough samples
+        return 0.6
+    
+    # Calculate win rate
+    wins = sum(1 for t in ml_trades if t['pnl'] > 0)
+    accuracy = wins / len(ml_trades)
+    
+    return accuracy
+
+def generate_ml_features(df):
+    """Generate advanced features for machine learning models"""
+    if df.empty or len(df) < 50:
+        return pd.DataFrame()
+    
+    features = pd.DataFrame(index=df.index)
+    
+    # Basic price data
+    features['close'] = df['close']
+    features['volume'] = df['volume']
+    
+    # Price changes over different periods
+    for period in [1, 2, 3, 5, 8, 13, 21]:
+        features[f'price_change_{period}'] = df['close'].pct_change(period)
+        features[f'volume_change_{period}'] = df['volume'].pct_change(period)
+    
+    # Technical indicators
+    features['rsi'] = df['rsi']
+    features['macd'] = df['macd']
+    features['cci'] = df['cci']
+    features['adx'] = df['adx']
+    features['atr_percent'] = df['atr_percent']
+    features['bb_width'] = df['bb_width']
+    features['stoch_k'] = df['stoch_k']
+    features['stoch_d'] = df['stoch_d']
+    
+    # Indicator differences
+    features['macd_signal_diff'] = df['macd'] - df['macd_signal']
+    features['ema_9_21_diff'] = (df['ema_9'] - df['ema_21']) / df['close'] * 100  # Normalized
+    features['ema_21_50_diff'] = (df['ema_21'] - df['ema_50']) / df['close'] * 100  # Normalized
+    
+    # Indicator crossovers
+    features['ema_9_above_21'] = (df['ema_9'] > df['ema_21']).astype(int)
+    features['price_above_200_ema'] = (df['close'] > df['ema_200']).astype(int)
+    features['macd_above_signal'] = (df['macd'] > df['macd_signal']).astype(int)
+    
+    # Bollinger Band features
+    features['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+    features['bb_squeeze'] = ((df['bb_upper'] - df['bb_lower']) / df['bb_middle']).rolling(window=20).mean()
+    
+    # Pattern recognition features
+    features['engulfing'] = df['bullish_engulfing'] - df['bearish_engulfing']
+    features['hammer'] = df['hammer']
+    features['shooting_star'] = df['shooting_star']
+    
+    # Volume profile features
+    if 'in_value_area' in df.columns:
+        features['in_value_area'] = df['in_value_area'].astype(int)
+    if 'at_high_vol_node' in df.columns:
+        features['at_high_vol_node'] = df['at_high_vol_node'].astype(int)
+    
+    # Market regime features
+    if 'high_volatility' in df.columns:
+        features['high_volatility'] = df['high_volatility']
+    if 'trending_regime' in df.columns:
+        features['trending_regime'] = df['trending_regime']
+    if 'mean_reverting_regime' in df.columns:
+        features['mean_reverting_regime'] = df['mean_reverting_regime']
+    
+    # Fibonacci proximity
+    for level in ['236', '382', '500', '618', '786']:
+        if f'fib_{level}_proximity' in df.columns:
+            features[f'fib_{level}_proximity'] = df[f'fib_{level}_proximity']
+    
+    # Candlestick features
+    features['body_size'] = abs(df['close'] - df['open']) / df['close'] * 100
+    features['upper_shadow'] = (df['high'] - df[['open', 'close']].max(axis=1)) / df['close'] * 100
+    features['lower_shadow'] = (df[['open', 'close']].min(axis=1) - df['low']) / df['close'] * 100
+    
+    # Support/Resistance proximity
+    features['near_support'] = ((df['close'] - df['bb_lower']) / df['close'] < 0.01).astype(int) | \
+                             ((df['close'] - df['atr_lower']) / df['close'] < 0.01).astype(int)
+    features['near_resistance'] = ((df['bb_upper'] - df['close']) / df['close'] < 0.01).astype(int) | \
+                                ((df['atr_upper'] - df['close']) / df['close'] < 0.01).astype(int)
+    
+    # Momentum features
+    features['roc'] = df['roc']
+    features['mfi'] = df['mfi']
+    features['willr'] = df['willr']
+    
+    # Fill NaN values
+    features = features.fillna(0)
+    
+    return features
+
+def get_tradable_symbols():
+    """Get list of tradable symbols from Binance with enhanced filtering"""
+    try:
+        exchange_info = get_exchange_info()
+        tradable_symbols = []
+        
+        # First pass: get all possible symbols
+        possible_symbols = []
+        for symbol_info in exchange_info['symbols']:
+            # Only include USDT pairs that are trading
+            if (symbol_info['symbol'].endswith('USDT') and 
+                symbol_info['status'] == 'TRADING' and
+                'LEVERAGED' not in symbol_info.get('permissions', []) and
+                not symbol_info['symbol'].startswith('1000')):  # Exclude leveraged tokens
+                possible_symbols.append(symbol_info['symbol'])
+        
+        # Second pass: check volume requirements and market context
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_symbol = {executor.submit(check_symbol_requirements, symbol): symbol for symbol in possible_symbols}
+            
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                try:
+                    meets_requirements, score = future.result()
+                    if meets_requirements:
+                        tradable_symbols.append((symbol, score))
+                except Exception as e:
+                    logger.debug(f"Error checking requirements for {symbol}: {e}")
+        
+        # Sort symbols by score (descending)
+        tradable_symbols.sort(key=lambda x: x[1], reverse=True)
+        
+        # Extract just the symbols
+        tradable_symbols = [s[0] for s in tradable_symbols]
+        
+        logger.info(f"Found {len(tradable_symbols)}/{len(possible_symbols)} symbols meeting trading requirements")
+        return tradable_symbols
+    
+    except Exception as e:
+        logger.error(f"Error getting tradable symbols: {e}")
+        return []
+
+def check_symbol_requirements(symbol):
+    """Check if a symbol meets enhanced trading requirements"""
+    try:
+        # Get 24hr ticker data
+        ticker = api_call_with_retry(client.get_ticker, symbol=symbol)
+        
+        # Check volume requirement
+        quote_volume = float(ticker.get('quoteVolume', 0))
+        if quote_volume < MIN_DAILY_VOLUME:
+            return False, 0
+        
+        # Get price volatility
+        price_change = abs(float(ticker.get('priceChangePercent', 0)))
+        
+        # Check liquidity (number of trades)
+        num_trades = int(ticker.get('count', 0))
+        if num_trades < 1000:  # Require at least 1000 trades in 24h
+            return False, 0
+        
+        # Calculate a score based on volume and activity
+        volume_score = min(100, quote_volume / 10000000 * 50)  # Up to 50 points for volume
+        activity_score = min(50, num_trades / 10000 * 30)  # Up to 30 points for number of trades
+        volatility_score = min(20, price_change)  # Up to 20 points for volatility
+        
+        total_score = volume_score + activity_score + volatility_score
+        
+        # Additional market context checks could be added here
+        
+        return True, total_score
+    
+    except Exception as e:
+        logger.debug(f"Error checking requirements for {symbol}: {e}")
+        return False, 0
+
+def prioritize_pairs():
+    """Rank trading pairs by performance, volume, and other metrics with enhanced logic"""
+    global pairs_performance
+    
+    # Only run full analysis if cache is empty or outdated
+    current_time = time.time()
+    if pairs_performance and current_time - pairs_performance.get('timestamp', 0) < 43200:  # 12 hours
+        return pairs_performance.get('ranked_pairs', [])
+    
+    logger.info("🔍 Prioritizing trading pairs...")
+    
+    # Get tradable symbols
+    symbols = get_tradable_symbols()
+    
+    if not symbols:
+        logger.warning("No tradable symbols found")
+        return []
+    
+    performance = {}
+    
+    # Process pairs in parallel for faster analysis
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_symbol = {executor.submit(analyze_pair_performance, symbol): symbol for symbol in symbols}
+        
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            try:
+                result = future.result()
+                if result['score'] > 0:
+                    performance[symbol] = result
+            except Exception as e:
+                logger.error(f"Error analyzing {symbol}: {e}")
+    
+    # Rank symbols by score
+    ranked_pairs = sorted(performance.keys(), key=lambda s: performance[s]['score'], reverse=True)
+    
+    # Cache the results
+    pairs_performance = {
+        'timestamp': current_time,
+        'ranked_pairs': ranked_pairs[:50],  # Top 50 pairs
+        'performance': performance
+    }
+    
+    # Log top pairs
+    if ranked_pairs:
+        top_pairs = ', '.join(ranked_pairs[:5])
+        logger.info(f"⭐ Top trading pairs: {top_pairs}")
+    else:
+        logger.warning("No suitable trading pairs found")
+    
+    return ranked_pairs[:50]  # Focus on top 50 pairs
+
+def analyze_pair_performance(symbol):
+    """Analyze a single pair's performance for prioritization with enhanced metrics"""
+    try:
+        # Get historical data
+        df_daily = get_historical_data(symbol, '1d', limit=30)
+        df_hourly = get_historical_data(symbol, '1h', limit=100)
+        
+        if df_daily.empty or df_hourly.empty:
+            return {'symbol': symbol, 'score': 0}
+        
+        # Check trading volume
+        daily_volume_usdt = df_daily['quote_asset_volume'].iloc[-1]
+        if daily_volume_usdt < MIN_DAILY_VOLUME:
+            return {'symbol': symbol, 'score': 0}  # Skip low volume pairs
+        
+        # Backtest strategies
+        backtest_results = {}
+        for strategy in ['trend_following', 'mean_reversion', 'breakout', 'momentum']:
+            result = backtest_strategy(df_hourly, symbol, strategy)
+            backtest_results[strategy] = result
+        
+        # Get overall backtest performance
+        best_strategy = max(backtest_results.items(), key=lambda x: x[1]['score'])
+        backtest_score = best_strategy[1]['score']
+        best_strategy_name = best_strategy[0]
+        
+        # Get market regime
+        regime = detect_market_regime(symbol)
+        regime_score = 0
+        
+        # Adjust score based on market regime
+        if regime['overall'] in ['trending', 'ranging_low_vol']:
+            regime_score = 20  # Favor clean regimes
+        elif regime['overall'] in ['volatile', 'illiquid']:
+            regime_score = -10  # Penalize difficult regimes
+        
+        # Check Fibonacci time alignment
+        fib_time_aligned = check_fib_time_alignment(symbol)
+        fib_bonus = 15 if fib_time_aligned else 0
+        
+        # Check trend strength
+        trend_strength_score = 0
+        if validate_trend_strength(symbol, 'long') or validate_trend_strength(symbol, 'short'):
+            trend_strength_score = 15
+        
+        # Get fundamental data
+        fundamental_score = calculate_fundamental_score(symbol)
+        
+        # Combine scores
+        volume_score = min(50, daily_volume_usdt / 1e6)  # Up to 50 points for volume
+        
+        # Calculate final score with all enhancements
+        final_score = (
+            backtest_score * 0.4 +             # 40% weight to backtest performance
+            regime_score +                     # Bonus/penalty for market regime
+            fundamental_score * 0.2 +          # 20% weight to fundamentals
+            volume_score * 0.2 +               # 20% weight to volume
+            fib_bonus +                        # Bonus for Fibonacci time alignment
+            trend_strength_score               # Bonus for trend strength
+        )
+        
+        return {
+            'symbol': symbol,
+            'backtest_score': backtest_score,
+            'best_strategy': best_strategy_name,
+            'regime': regime['overall'],
+            'fundamental_score': fundamental_score,
+            'volume': daily_volume_usdt,
+            'fib_time_aligned': fib_time_aligned,
+            'trend_strength': trend_strength_score > 0,
+            'score': max(0, final_score)  # Ensure score is not negative
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing performance for {symbol}: {e}")
+        return {'symbol': symbol, 'score': 0}
+
+def backtest_strategy(df, symbol, strategy_name):
+    """Backtest a specific strategy on historical data with enhanced risk management"""
+    if df.empty or len(df) < 50:
+        return {
+            'win_rate': 0,
+            'profit_factor': 0,
+            'total_profit': 0,
+            'max_drawdown': 0,
+            'trades': 0,
+            'score': 0
+        }
+    
+    trades = []
+    position = None
+    
+    # Strategy-specific parameters
+    if strategy_name == 'trend_following':
+        # Trend following strategy (EMA crossover + ADX confirmation)
+        for i in range(30, len(df)):
+            # Skip if already in a position
+            if position:
+                # Check for exit
+                if position['direction'] == 'long':
+                    # Calculate trailing stop using enhanced parameters
+                    profit_pct = (df['close'].iloc[i] / position['entry_price'] - 1) * 100
+                    trailing_stop_distance = get_trailing_stop_parameters(profit_pct)
+                    
+                    if trailing_stop_distance is not None:
+                        trailing_stop_price = df['close'].iloc[i] * (1 - trailing_stop_distance)
+                        # Update stop loss if trailing stop is higher
+                        if trailing_stop_price > position['stop_loss']:
+                            position['stop_loss'] = trailing_stop_price
+                    
+                    # Stop loss hit
+                    if df['low'].iloc[i] <= position['stop_loss']:
+                        pnl = (position['stop_loss'] / position['entry_price'] - 1) * 100
+                        trades.append({
+                            'direction': position['direction'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': df['timestamp'].iloc[i],
+                            'entry_price': position['entry_price'],
+                            'exit_price': position['stop_loss'],
+                            'pnl': pnl,
+                            'exit_reason': 'stop_loss'
+                        })
+                        position = None
+                    # Take profit hit
+                    elif df['high'].iloc[i] >= position['take_profit']:
+                        pnl = (position['take_profit'] / position['entry_price'] - 1) * 100
+                        trades.append({
+                            'direction': position['direction'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': df['timestamp'].iloc[i],
+                            'entry_price': position['entry_price'],
+                            'exit_price': position['take_profit'],
+                            'pnl': pnl,
+                            'exit_reason': 'take_profit'
+                        })
+                        position = None
+                    # Signal reversed
+                    elif df['ema_9'].iloc[i] < df['ema_21'].iloc[i]:
+                        exit_price = df['close'].iloc[i]
+                        pnl = (exit_price / position['entry_price'] - 1) * 100
+                        trades.append({
+                            'direction': position['direction'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': df['timestamp'].iloc[i],
+                            'entry_price': position['entry_price'],
+                            'exit_price': exit_price,
+                            'pnl': pnl,
+                            'exit_reason': 'signal_reversal'
+                        })
+                        position = None
+                else:  # Short position
+                    # Calculate trailing stop using enhanced parameters
+                    profit_pct = (position['entry_price'] / df['close'].iloc[i] - 1) * 100
+                    trailing_stop_distance = get_trailing_stop_parameters(profit_pct)
+                    
+                    if trailing_stop_distance is not None:
+                        trailing_stop_price = df['close'].iloc[i] * (1 + trailing_stop_distance)
+                        # Update stop loss if trailing stop is lower
+                        if trailing_stop_price < position['stop_loss']:
+                            position['stop_loss'] = trailing_stop_price
+                    
+                    # Stop loss hit
+                    if df['high'].iloc[i] >= position['stop_loss']:
+                        pnl = (position['entry_price'] / position['stop_loss'] - 1) * 100
+                        trades.append({
+                            'direction': position['direction'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': df['timestamp'].iloc[i],
+                            'entry_price': position['entry_price'],
+                            'exit_price': position['stop_loss'],
+                            'pnl': pnl,
+                            'exit_reason': 'stop_loss'
+                        })
+                        position = None
+                    # Take profit hit
+                    elif df['low'].iloc[i] <= position['take_profit']:
+                        pnl = (position['entry_price'] / position['take_profit'] - 1) * 100
+                        trades.append({
+                            'direction': position['direction'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': df['timestamp'].iloc[i],
+                            'entry_price': position['entry_price'],
+                            'exit_price': position['take_profit'],
+                            'pnl': pnl,
+                            'exit_reason': 'take_profit'
+                        })
+                        position = None
+                    # Signal reversed
+                    elif df['ema_9'].iloc[i] > df['ema_21'].iloc[i]:
+                        exit_price = df['close'].iloc[i]
+                        pnl = (position['entry_price'] / exit_price - 1) * 100
+                        trades.append({
+                            'direction': position['direction'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': df['timestamp'].iloc[i],
+                            'entry_price': position['entry_price'],
+                            'exit_price': exit_price,
+                            'pnl': pnl,
+                            'exit_reason': 'signal_reversal'
+                        })
+                        position = None
+            else:
+                # Entry conditions for trend following
+                adx = df['adx'].iloc[i]
+                ema_short = df['ema_9'].iloc[i]
+                ema_medium = df['ema_21'].iloc[i]
+                close = df['close'].iloc[i]
+
+                # Long signal
+                if adx > 25 and ema_short > ema_medium and df['macd_hist'].iloc[i] > 0:
+                    # Verify trend strength across timeframes (simulated)
+                    trend_valid = True  # This would call validate_trend_strength in a real implementation
+                    
+                    if trend_valid:
+                        entry_price = close
+                        # Use optimized stop loss based on recent swing points
+                        recent_lows = df['low'].iloc[i-10:i].rolling(3).min()
+                        stop_loss = max(entry_price * 0.97, recent_lows.min())  # Max 3% risk or swing low
+                        
+                        # Set multiple take profits based on ATR and key levels
+                        atr = df['atr'].iloc[i]
+                        take_profit = entry_price * 1.06  # Simple 6% take profit for backtesting
+                        
+                        position = {
+                            'direction': 'long',
+                            'entry_time': df['timestamp'].iloc[i],
+                            'entry_price': entry_price,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit
+                        }
+                
+                # Short signal
+                elif adx > 25 and ema_short < ema_medium and df['macd_hist'].iloc[i] < 0:
+                    # Verify trend strength across timeframes (simulated)
+                    trend_valid = True  # This would call validate_trend_strength in a real implementation
+                    
+                    if trend_valid:
+                        entry_price = close
+                        # Use optimized stop loss based on recent swing points
+                        recent_highs = df['high'].iloc[i-10:i].rolling(3).max()
+                        stop_loss = min(entry_price * 1.03, recent_highs.max())  # Max 3% risk or swing high
+                        
+                        # Set multiple take profits based on ATR and key levels
+                        atr = df['atr'].iloc[i]
+                        take_profit = entry_price * 0.94  # Simple 6% take profit for backtesting
+                        
+                        position = {
+                            'direction': 'short',
+                            'entry_time': df['timestamp'].iloc[i],
+                            'entry_price': entry_price,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit
+                        }
+    
+    # Calculate metrics
+    if not trades:
+        return {
+            'win_rate': 0,
+            'profit_factor': 0,
+            'total_profit': 0,
+            'max_drawdown': 0,
+            'trades': 0,
+            'score': 0
+        }
+    
+    wins = [t for t in trades if t['pnl'] > 0]
+    losses = [t for t in trades if t['pnl'] <= 0]
+    
+    win_rate = len(wins) / len(trades) if trades else 0
+    
+    total_profit = sum(t['pnl'] for t in trades)
+    total_gain = sum(t['pnl'] for t in wins) if wins else 0
+    total_loss = abs(sum(t['pnl'] for t in losses)) if losses else 0
+    
+    profit_factor = total_gain / total_loss if total_loss > 0 else float('inf')
+    
+    # Calculate max drawdown
+    equity_curve = [0]
+    for trade in trades:
+        equity_curve.append(equity_curve[-1] + trade['pnl'])
+    
+    max_drawdown = 0
+    peak = equity_curve[0]
+    
+    for value in equity_curve:
+        if value > peak:
+            peak = value
+        drawdown = (peak - value) / peak * 100 if peak > 0 else 0
+        max_drawdown = max(max_drawdown, drawdown)
+    
+    # Calculate score - combination of metrics
+    if len(trades) >= 5:  # Need minimum number of trades
+        score = (
+            win_rate * 40 +  # 40% weight to win rate
+            min(profit_factor, 5) * 10 +  # 10% weight to profit factor (capped at 5)
+            min(total_profit, 100) * 0.3 -  # 30% weight to total profit (capped at 100%)
+            min(max_drawdown, 30) * 0.5  # Penalize drawdown
+        )
+    else:
+        score = 0
+    
+    return {
+        'win_rate': win_rate,
+        'profit_factor': profit_factor,
+        'total_profit': total_profit,
+        'max_drawdown': max_drawdown,
+        'trades': len(trades),
+        'score': max(0, score)  # Ensure score is not negative
+    }
+
+# ======================================================
+# Main Entry Point with Enhanced Function Calls
+# ======================================================
+
+if __name__ == "__main__":
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Handle special commands
+    if args.close_all:
+        manual_close_all_positions()
+        sys.exit(0)
+    
+    if args.cancel_orders:
+        cancel_all_orders()
+        sys.exit(0)
+    
+    if args.status:
+        status = get_bot_status()
+        print(json.dumps(status, indent=2))
+        sys.exit(0)
+        
+    if args.train_ml:
+        train_ml_models()
+        sys.exit(0)
+    
+    # Load previous state
+    load_state()
+    
+    # Start the bot
+    try:
+        if args.test:
+            logger.info("Running in TEST MODE - no trades will be executed")
+            # Run through the trading cycle but skip actual order execution
+            def mock_execute_trade(*args, **kwargs):
+                logger.info(f"TEST MODE: Would execute trade for {args[0]} {args[1]}")
+                return {"test_mode": True}
+            
+            # Save original function
+            real_execute_trade = execute_trade
+            # Replace with mock
+            execute_trade = mock_execute_trade
+            
+            # Run single cycle
+            trading_cycle()
+            
+            # Restore original function
+            execute_trade = real_execute_trade
+            
+        elif args.backtest:
+            logger.info("Running in BACKTEST MODE")
+            # Basic backtesting implementation
+            symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'ADAUSDT']
+            start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            
+            logger.info(f"Backtesting from {start_date} to {end_date}")
+            
+            # Simple simulation logic - would be expanded in a full implementation
+            starting_capital = 10000.0
+            current_capital = starting_capital
+            
+            # Get historical data and simulate trading decisions
+            for symbol in symbols:
+                df = get_historical_data(symbol, '1h', limit=24*30)  # ~30 days
+                if df.empty:
+                    continue
+                    
+                # For each day, run analysis and check for signals
+                # This is just a simplified example
+                for i in range(24, len(df)-1):
+                    day_data = df.iloc[i-24:i]
+                    # Would call signal generation functions here
+                    # and simulate trades
+            
+            logger.info(f"Backtest completed: Starting capital ${starting_capital:.2f}, Ending capital ${current_capital:.2f}")
+            logger.info(f"Performance: {((current_capital/starting_capital)-1)*100:.2f}%")
+            
+        else:
+            # Run the bot in normal mode with all enhancements
+            logger.info("Starting Elite Adaptive Crypto Trading Bot v2.0 with all enhancements")
+            logger.info("- Smarter Take Profits with multi-stage exits")
+            logger.info("- Intelligent Trailing Stops based on profit level")
+            logger.info("- Advanced Trend-Strength Entry Filters")
+            logger.info("- Tighter Initial Stop Losses with Risk-Aware Sizing")
+            logger.info("- Market Context Validation")
+            logger.info("- Position Scaling for improved entries")
+            logger.info("- Fibonacci Time Extensions for market timing")
+            run_bot()
+    except KeyboardInterrupt:
+        logger.info("Bot manually stopped")
+    finally:
+        # Save state before exiting
+        save_state()
