@@ -13,7 +13,7 @@ import warnings
 import pickle
 import talib
 import joblib
-import os.path
+import os
 import threading
 import queue
 import torch
@@ -82,9 +82,12 @@ logger.addHandler(file_handler)
 for log_name in ['urllib3', 'websocket', 'matplotlib', 'binance', 'sklearn']:
     logging.getLogger(log_name).setLevel(logging.WARNING)
 
-# Configuration - API credentials (enter your keys here)
-API_KEY = "n0ayUpewIzqIp7PuGJ1ba273nSpcbh1QqNBUcQ1B40vvmNCgxBA8g20lNZqzKd5R"  # Replace with your Binance API key
-API_SECRET = "wLEDHu8WYADfLvu2buohYQz8FYWfg8nauiFecGxraYUqB9KRM3r3FQ8dNGc6uHtv"  # Replace with your Binance API secret
+# Configuration - API credentials via environment variables
+API_KEY = os.environ.get("BINANCE_API_KEY")
+API_SECRET = os.environ.get("BINANCE_API_SECRET")
+if not API_KEY or not API_SECRET:
+    logger.critical("Binance API credentials not provided")
+    sys.exit(1)
 
 # ======================================================
 # Trading Parameters - Customizable
@@ -2349,8 +2352,6 @@ def parse_arguments():
     import argparse
     
     parser = argparse.ArgumentParser(description='Elite Adaptive Crypto Trading Bot')
-    parser.add_argument('--test', action='store_true', help='Run in test mode without executing trades')
-    parser.add_argument('--backtest', action='store_true', help='Run backtesting on historical data')
     parser.add_argument('--close-all', action='store_true', help='Close all open positions and exit')
     parser.add_argument('--cancel-orders', action='store_true', help='Cancel all open orders and exit')
     parser.add_argument('--status', action='store_true', help='Show bot status and exit')
@@ -3693,7 +3694,7 @@ def check_ml_retraining():
 def evaluate_ml_performance():
     """Evaluate recent ML prediction accuracy"""
     # This would track actual performance against predictions
-    # For now we'll return a placeholder value
+    # Return a default value if insufficient history is available
     if not trade_history:
         return 0.6  # Default value
     
@@ -3936,16 +3937,8 @@ def analyze_pair_performance(symbol):
         if daily_volume_usdt < MIN_DAILY_VOLUME:
             return {'symbol': symbol, 'score': 0}  # Skip low volume pairs
         
-        # Backtest strategies
-        backtest_results = {}
-        for strategy in ['trend_following', 'mean_reversion', 'breakout', 'momentum']:
-            result = backtest_strategy(df_hourly, symbol, strategy)
-            backtest_results[strategy] = result
-        
-        # Get overall backtest performance
-        best_strategy = max(backtest_results.items(), key=lambda x: x[1]['score'])
-        backtest_score = best_strategy[1]['score']
-        best_strategy_name = best_strategy[0]
+        backtest_score = 0
+        best_strategy_name = None
         
         # Get market regime
         regime = detect_market_regime(symbol)
@@ -3971,10 +3964,9 @@ def analyze_pair_performance(symbol):
         
         # Combine scores
         volume_score = min(50, daily_volume_usdt / 1e6)  # Up to 50 points for volume
-        
+
         # Calculate final score with all enhancements
         final_score = (
-            backtest_score * 0.4 +             # 40% weight to backtest performance
             regime_score +                     # Bonus/penalty for market regime
             fundamental_score * 0.2 +          # 20% weight to fundamentals
             volume_score * 0.2 +               # 20% weight to volume
@@ -3984,7 +3976,6 @@ def analyze_pair_performance(symbol):
         
         return {
             'symbol': symbol,
-            'backtest_score': backtest_score,
             'best_strategy': best_strategy_name,
             'regime': regime['overall'],
             'fundamental_score': fundamental_score,
@@ -3997,238 +3988,6 @@ def analyze_pair_performance(symbol):
         logger.error(f"Error analyzing performance for {symbol}: {e}")
         return {'symbol': symbol, 'score': 0}
 
-def backtest_strategy(df, symbol, strategy_name):
-    """Backtest a specific strategy on historical data with enhanced risk management"""
-    if df.empty or len(df) < 50:
-        return {
-            'win_rate': 0,
-            'profit_factor': 0,
-            'total_profit': 0,
-            'max_drawdown': 0,
-            'trades': 0,
-            'score': 0
-        }
-    
-    trades = []
-    position = None
-    
-    # Strategy-specific parameters
-    if strategy_name == 'trend_following':
-        # Trend following strategy (EMA crossover + ADX confirmation)
-        for i in range(30, len(df)):
-            # Skip if already in a position
-            if position:
-                # Check for exit
-                if position['direction'] == 'long':
-                    # Calculate trailing stop using enhanced parameters
-                    profit_pct = (df['close'].iloc[i] / position['entry_price'] - 1) * 100
-                    trailing_stop_distance = get_trailing_stop_parameters(profit_pct)
-                    
-                    if trailing_stop_distance is not None:
-                        trailing_stop_price = df['close'].iloc[i] * (1 - trailing_stop_distance)
-                        # Update stop loss if trailing stop is higher
-                        if trailing_stop_price > position['stop_loss']:
-                            position['stop_loss'] = trailing_stop_price
-                    
-                    # Stop loss hit
-                    if df['low'].iloc[i] <= position['stop_loss']:
-                        pnl = (position['stop_loss'] / position['entry_price'] - 1) * 100
-                        trades.append({
-                            'direction': position['direction'],
-                            'entry_time': position['entry_time'],
-                            'exit_time': df['timestamp'].iloc[i],
-                            'entry_price': position['entry_price'],
-                            'exit_price': position['stop_loss'],
-                            'pnl': pnl,
-                            'exit_reason': 'stop_loss'
-                        })
-                        position = None
-                    # Take profit hit
-                    elif df['high'].iloc[i] >= position['take_profit']:
-                        pnl = (position['take_profit'] / position['entry_price'] - 1) * 100
-                        trades.append({
-                            'direction': position['direction'],
-                            'entry_time': position['entry_time'],
-                            'exit_time': df['timestamp'].iloc[i],
-                            'entry_price': position['entry_price'],
-                            'exit_price': position['take_profit'],
-                            'pnl': pnl,
-                            'exit_reason': 'take_profit'
-                        })
-                        position = None
-                    # Signal reversed
-                    elif df['ema_9'].iloc[i] < df['ema_21'].iloc[i]:
-                        exit_price = df['close'].iloc[i]
-                        pnl = (exit_price / position['entry_price'] - 1) * 100
-                        trades.append({
-                            'direction': position['direction'],
-                            'entry_time': position['entry_time'],
-                            'exit_time': df['timestamp'].iloc[i],
-                            'entry_price': position['entry_price'],
-                            'exit_price': exit_price,
-                            'pnl': pnl,
-                            'exit_reason': 'signal_reversal'
-                        })
-                        position = None
-                else:  # Short position
-                    # Calculate trailing stop using enhanced parameters
-                    profit_pct = (position['entry_price'] / df['close'].iloc[i] - 1) * 100
-                    trailing_stop_distance = get_trailing_stop_parameters(profit_pct)
-                    
-                    if trailing_stop_distance is not None:
-                        trailing_stop_price = df['close'].iloc[i] * (1 + trailing_stop_distance)
-                        # Update stop loss if trailing stop is lower
-                        if trailing_stop_price < position['stop_loss']:
-                            position['stop_loss'] = trailing_stop_price
-                    
-                    # Stop loss hit
-                    if df['high'].iloc[i] >= position['stop_loss']:
-                        pnl = (position['entry_price'] / position['stop_loss'] - 1) * 100
-                        trades.append({
-                            'direction': position['direction'],
-                            'entry_time': position['entry_time'],
-                            'exit_time': df['timestamp'].iloc[i],
-                            'entry_price': position['entry_price'],
-                            'exit_price': position['stop_loss'],
-                            'pnl': pnl,
-                            'exit_reason': 'stop_loss'
-                        })
-                        position = None
-                    # Take profit hit
-                    elif df['low'].iloc[i] <= position['take_profit']:
-                        pnl = (position['entry_price'] / position['take_profit'] - 1) * 100
-                        trades.append({
-                            'direction': position['direction'],
-                            'entry_time': position['entry_time'],
-                            'exit_time': df['timestamp'].iloc[i],
-                            'entry_price': position['entry_price'],
-                            'exit_price': position['take_profit'],
-                            'pnl': pnl,
-                            'exit_reason': 'take_profit'
-                        })
-                        position = None
-                    # Signal reversed
-                    elif df['ema_9'].iloc[i] > df['ema_21'].iloc[i]:
-                        exit_price = df['close'].iloc[i]
-                        pnl = (position['entry_price'] / exit_price - 1) * 100
-                        trades.append({
-                            'direction': position['direction'],
-                            'entry_time': position['entry_time'],
-                            'exit_time': df['timestamp'].iloc[i],
-                            'entry_price': position['entry_price'],
-                            'exit_price': exit_price,
-                            'pnl': pnl,
-                            'exit_reason': 'signal_reversal'
-                        })
-                        position = None
-            else:
-                # Entry conditions for trend following
-                adx = df['adx'].iloc[i]
-                ema_short = df['ema_9'].iloc[i]
-                ema_medium = df['ema_21'].iloc[i]
-                close = df['close'].iloc[i]
-
-                # Long signal
-                if adx > 25 and ema_short > ema_medium and df['macd_hist'].iloc[i] > 0:
-                    # Verify trend strength across timeframes (simulated)
-                    trend_valid = True  # This would call validate_trend_strength in a real implementation
-                    
-                    if trend_valid:
-                        entry_price = close
-                        # Use optimized stop loss based on recent swing points
-                        recent_lows = df['low'].iloc[i-10:i].rolling(3).min()
-                        stop_loss = max(entry_price * 0.97, recent_lows.min())  # Max 3% risk or swing low
-                        
-                        # Set multiple take profits based on ATR and key levels
-                        atr = df['atr'].iloc[i]
-                        take_profit = entry_price * 1.06  # Simple 6% take profit for backtesting
-                        
-                        position = {
-                            'direction': 'long',
-                            'entry_time': df['timestamp'].iloc[i],
-                            'entry_price': entry_price,
-                            'stop_loss': stop_loss,
-                            'take_profit': take_profit
-                        }
-                
-                # Short signal
-                elif adx > 25 and ema_short < ema_medium and df['macd_hist'].iloc[i] < 0:
-                    # Verify trend strength across timeframes (simulated)
-                    trend_valid = True  # This would call validate_trend_strength in a real implementation
-                    
-                    if trend_valid:
-                        entry_price = close
-                        # Use optimized stop loss based on recent swing points
-                        recent_highs = df['high'].iloc[i-10:i].rolling(3).max()
-                        stop_loss = min(entry_price * 1.03, recent_highs.max())  # Max 3% risk or swing high
-                        
-                        # Set multiple take profits based on ATR and key levels
-                        atr = df['atr'].iloc[i]
-                        take_profit = entry_price * 0.94  # Simple 6% take profit for backtesting
-                        
-                        position = {
-                            'direction': 'short',
-                            'entry_time': df['timestamp'].iloc[i],
-                            'entry_price': entry_price,
-                            'stop_loss': stop_loss,
-                            'take_profit': take_profit
-                        }
-    
-    # Calculate metrics
-    if not trades:
-        return {
-            'win_rate': 0,
-            'profit_factor': 0,
-            'total_profit': 0,
-            'max_drawdown': 0,
-            'trades': 0,
-            'score': 0
-        }
-    
-    wins = [t for t in trades if t['pnl'] > 0]
-    losses = [t for t in trades if t['pnl'] <= 0]
-    
-    win_rate = len(wins) / len(trades) if trades else 0
-    
-    total_profit = sum(t['pnl'] for t in trades)
-    total_gain = sum(t['pnl'] for t in wins) if wins else 0
-    total_loss = abs(sum(t['pnl'] for t in losses)) if losses else 0
-    
-    profit_factor = total_gain / total_loss if total_loss > 0 else float('inf')
-    
-    # Calculate max drawdown
-    equity_curve = [0]
-    for trade in trades:
-        equity_curve.append(equity_curve[-1] + trade['pnl'])
-    
-    max_drawdown = 0
-    peak = equity_curve[0]
-    
-    for value in equity_curve:
-        if value > peak:
-            peak = value
-        drawdown = (peak - value) / peak * 100 if peak > 0 else 0
-        max_drawdown = max(max_drawdown, drawdown)
-    
-    # Calculate score - combination of metrics
-    if len(trades) >= 5:  # Need minimum number of trades
-        score = (
-            win_rate * 40 +  # 40% weight to win rate
-            min(profit_factor, 5) * 10 +  # 10% weight to profit factor (capped at 5)
-            min(total_profit, 100) * 0.3 -  # 30% weight to total profit (capped at 100%)
-            min(max_drawdown, 30) * 0.5  # Penalize drawdown
-        )
-    else:
-        score = 0
-    
-    return {
-        'win_rate': win_rate,
-        'profit_factor': profit_factor,
-        'total_profit': total_profit,
-        'max_drawdown': max_drawdown,
-        'trades': len(trades),
-        'score': max(0, score)  # Ensure score is not negative
-    }
 
 # ======================================================
 # Main Entry Point with Enhanced Function Calls
@@ -4261,64 +4020,15 @@ if __name__ == "__main__":
     
     # Start the bot
     try:
-        if args.test:
-            logger.info("Running in TEST MODE - no trades will be executed")
-            # Run through the trading cycle but skip actual order execution
-            def mock_execute_trade(*args, **kwargs):
-                logger.info(f"TEST MODE: Would execute trade for {args[0]} {args[1]}")
-                return {"test_mode": True}
-            
-            # Save original function
-            real_execute_trade = execute_trade
-            # Replace with mock
-            execute_trade = mock_execute_trade
-            
-            # Run single cycle
-            trading_cycle()
-            
-            # Restore original function
-            execute_trade = real_execute_trade
-            
-        elif args.backtest:
-            logger.info("Running in BACKTEST MODE")
-            # Basic backtesting implementation
-            symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'ADAUSDT']
-            start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            
-            logger.info(f"Backtesting from {start_date} to {end_date}")
-            
-            # Simple simulation logic - would be expanded in a full implementation
-            starting_capital = 10000.0
-            current_capital = starting_capital
-            
-            # Get historical data and simulate trading decisions
-            for symbol in symbols:
-                df = get_historical_data(symbol, '1h', limit=24*30)  # ~30 days
-                if df.empty:
-                    continue
-                    
-                # For each day, run analysis and check for signals
-                # This is just a simplified example
-                for i in range(24, len(df)-1):
-                    day_data = df.iloc[i-24:i]
-                    # Would call signal generation functions here
-                    # and simulate trades
-            
-            logger.info(f"Backtest completed: Starting capital ${starting_capital:.2f}, Ending capital ${current_capital:.2f}")
-            logger.info(f"Performance: {((current_capital/starting_capital)-1)*100:.2f}%")
-            
-        else:
-            # Run the bot in normal mode with all enhancements
-            logger.info("Starting Elite Adaptive Crypto Trading Bot v2.0 with all enhancements")
-            logger.info("- Smarter Take Profits with multi-stage exits")
-            logger.info("- Intelligent Trailing Stops based on profit level")
-            logger.info("- Advanced Trend-Strength Entry Filters")
-            logger.info("- Tighter Initial Stop Losses with Risk-Aware Sizing")
-            logger.info("- Market Context Validation")
-            logger.info("- Position Scaling for improved entries")
-            logger.info("- Fibonacci Time Extensions for market timing")
-            run_bot()
+        logger.info("Starting Elite Adaptive Crypto Trading Bot v2.0 with all enhancements")
+        logger.info("- Smarter Take Profits with multi-stage exits")
+        logger.info("- Intelligent Trailing Stops based on profit level")
+        logger.info("- Advanced Trend-Strength Entry Filters")
+        logger.info("- Tighter Initial Stop Losses with Risk-Aware Sizing")
+        logger.info("- Market Context Validation")
+        logger.info("- Position Scaling for improved entries")
+        logger.info("- Fibonacci Time Extensions for market timing")
+        run_bot()
     except KeyboardInterrupt:
         logger.info("Bot manually stopped")
     finally:
